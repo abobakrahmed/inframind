@@ -1,128 +1,69 @@
-# AI SRE Agent — Google Cloud Platform
+# AI SRE Agent — Google Cloud
 
-An AI-powered Site Reliability Engineering platform that manages GCP infrastructure through natural language — chat or voice. Built with Gemini, Terraform, and Streamlit.
+An AI-powered infrastructure engineer that writes, plans, and applies Terraform on Google Cloud Platform. Talk to it in chat or by voice — it handles the rest.
+
+Built for the [Gemini Live Agent Challenge](https://geminiliveagentchallenge.devpost.com/).
 
 ---
 
 ## What it does
 
-- **Chat & Voice** — describe infrastructure in plain English or speak it, the agent writes and applies the Terraform
-- **Deploy Agent** — generates HCL, runs `terraform plan`, shows cost + security audit, applies on confirmation
-- **Monitor Agent** — runs every 2 minutes, detects anomalies (VM failures, high error rates, public buckets), alerts via Slack / email / PagerDuty
-- **Security Agent** — scans every resource for misconfigurations, auto-fixes issues before apply
-- **Observability** — query live GCP state: "list all VMs", "show recent errors", "how big is bucket X"
-- **Audit Trail** — every action logged to GCS + local JSONL with full version history and rollback
+- **Generates Terraform HCL** from plain English — "create a VM type micro in us-central1 with Ubuntu 24"
+- **Plans before applying** — shows you exactly what will change, with cost estimate and security audit
+- **Applies to GCP** — one click deploys real infrastructure
+- **Voice commands** — speak your request, review what it heard, send to agent
+- **Live GCP queries** — "list all VMs", "show recent logs", "how big is bucket X"
+- **Security audit** — detects misconfigurations and auto-fixes them before apply
+- **Version history & rollback** — every apply is versioned, one-click revert
+- **Remote state** — Terraform state stored in GCS, never lost
+- **Audit trail** — every action logged to JSONL locally and in GCS
 
 ---
 
-## Architecture
+## Requirements
 
-```
-User (chat / voice)
-        │
-   Auth Proxy (JWT)
-        │
-   Redis Event Bus
-   ┌────┴──────────────────────────┐
-   │                               │
-Deploy Agent          Monitor Agent (background)
-   │                       │
-Gemini AI ◄────────────────┘
-   │
-GCP REST APIs → Terraform → GCS Remote State
-```
-
-**Services (docker-compose):**
-
-| Container | Role |
-|---|---|
-| `ai-sre-gcp` | Main Streamlit UI + Deploy/Security/Voice agents |
-| `monitor-agent` | Autonomous 24/7 monitoring loop |
-| `auth` | Auth proxy with JWT sessions |
-| `redis` | Event bus between all services |
+- Docker + Docker Compose
+- A GCP project with billing enabled
+- A GCP service account JSON key with these roles:
+  - `Editor` or `Compute Admin`, `Storage Admin`, `Logging Viewer`
+- A Gemini API key from [Google AI Studio](https://aistudio.google.com/)
 
 ---
 
-## Quick Start
+## Quick start
 
-### 1. Clone and configure
+**1. Clone and configure**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-sre-agent.git
-cd ai-sre-agent
+git clone https://github.com/your-username/ai-sre-agent-gcp.git
+cd ai-sre-agent-gcp
 cp .env.example .env
 ```
 
-Edit `.env`:
+**2. Fill in `.env`**
 
 ```env
-GCP_PROJECT_ID=your-project-id
-GCP_DEFAULT_REGION=us-central1
+# Required
 GEMINI_API_KEY=your-gemini-api-key
-GOOGLE_CREDENTIALS={"type":"service_account",...}   # SA JSON as string
-TF_STATE_BUCKET=your-gcs-bucket-for-tfstate
+GCP_PROJECT_ID=your-gcp-project-id
+GOOGLE_CREDENTIALS={"type":"service_account","project_id":"..."}   # paste SA JSON as one line
+
+# Optional but recommended
+GCP_DEFAULT_REGION=us-central1
+GEMINI_MODEL=gemini-3.1-pro
+VOICE_MODEL=gemini-2.5-flash
+TF_STATE_BUCKET=your-gcs-bucket-for-tfstate   # if blank, state is stored locally
 ```
 
-### 2. GCP service account permissions
-
-The SA needs these roles:
-
-```
-roles/compute.admin
-roles/storage.admin
-roles/logging.viewer
-roles/run.admin
-roles/iam.securityReviewer
-```
-
-### 3. Start
+**3. Start**
 
 ```bash
 docker-compose up -d
 ```
 
-Open `http://localhost:8080`
+Open [http://localhost:8080](http://localhost:8080)
 
----
-
-## Example commands
-
-```
-create vm prod-api e2-medium us-central1 os=ubuntu-2404-lts
-create GKE cluster with 3 nodes in europe-west1
-remove all test-* buckets
-list all VMs
-show recent errors last 30 minutes
-what is the disk size of vm prod-api
-fix security issues
-```
-
----
-
-## Monitor Agent
-
-Runs as a separate container, polls GCP every 2 minutes.
-
-**Alerts on:**
-- VM in unexpected state (not RUNNING)
-- Log error rate above threshold (default: 10/min)
-- CRITICAL log entries
-- Bucket with public access
-- Cloud Run service not ready
-- Unexpected VM count changes (drift)
-- AI-detected anomalies via Gemini
-
-**Alert channels** (configure in `.env`):
-
-```env
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-ALERT_EMAIL_TO=ops@company.com
-SMTP_HOST=smtp.gmail.com
-SMTP_USER=alerts@company.com
-SMTP_PASSWORD=app-password
-PAGERDUTY_ROUTING_KEY=your-key   # critical/high alerts only
-MONITOR_INTERVAL_SECS=120
-```
+Default login: `admin` / `changeme` — edit `auth-service/users.json` to change.
 
 ---
 
@@ -130,31 +71,17 @@ MONITOR_INTERVAL_SECS=120
 
 | Variable | Required | Description |
 |---|---|---|
-| `GCP_PROJECT_ID` | ✅ | GCP project ID |
-| `GEMINI_API_KEY` | ✅ | Google AI API key |
-| `GOOGLE_CREDENTIALS` | ✅ | Service account JSON string |
-| `GCP_DEFAULT_REGION` | ✅ | Default region (e.g. `us-central1`) |
-| `TF_STATE_BUCKET` | ✅ | GCS bucket for Terraform remote state |
-| `GEMINI_MODEL` | — | Override model (default: `gemini-3.1-pro-preview`) |
-| `VOICE_MODEL` | — | Voice transcription model (default: `gemini-2.0-flash`) |
-| `SLACK_WEBHOOK_URL` | — | Slack alerts |
-| `ALERT_EMAIL_TO` | — | Email alert recipients |
-| `PAGERDUTY_ROUTING_KEY` | — | PagerDuty critical alerts |
-| `MONITOR_INTERVAL_SECS` | — | Monitor poll interval (default: `120`) |
-| `CPU_ALERT_PCT` | — | CPU alert threshold (default: `85`) |
-| `LOG_ERROR_RATE_THRESHOLD` | — | Errors/min to alert (default: `10`) |
+| `GEMINI_API_KEY` | yes | Gemini API key from AI Studio |
+| `GCP_PROJECT_ID` | yes | GCP project ID |
+| `GOOGLE_CREDENTIALS` | yes* | Service account JSON as a string |
+| `GOOGLE_APPLICATION_CREDENTIALS` | yes* | Path to SA JSON file (alternative to above) |
+| `GCP_DEFAULT_REGION` | no | Default region (default: `us-central1`) |
+| `GEMINI_MODEL` | no | Model for IaC generation (default: `gemini-3.1-pro`) |
+| `VOICE_MODEL` | no | Model for voice transcription (default: `gemini-2.5-flash`) |
+| `TF_STATE_BUCKET` | no | GCS bucket name for remote Terraform state |
+| `TF_STATE_PREFIX` | no | GCS path prefix (default: `ai-sre-agent/terraform.tfstate`) |
 
----
-
-## Tech stack
-
-- **AI** — Google Gemini (gemini-3.1-pro-preview, gemini-2.5-flash, gemini-2.0-flash)
-- **IaC** — Terraform + GCS remote state
-- **UI** — Streamlit
-- **Event bus** — Redis
-- **Auth** — FastAPI JWT proxy
-- **Cloud** — Google Cloud Platform (Compute, Storage, Logging, Run, GKE)
-- **Notifications** — Slack, SMTP email, PagerDuty
+*One of `GOOGLE_CREDENTIALS` or `GOOGLE_APPLICATION_CREDENTIALS` is required.
 
 ---
 
@@ -162,25 +89,89 @@ MONITOR_INTERVAL_SECS=120
 
 ```
 .
-├── agent.py                  # Core AI agent + all job workers
-├── ui.py                     # Streamlit frontend
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yaml
-├── monitor-agent/
-│   ├── monitor_agent.py      # Autonomous monitoring service
-│   └── Dockerfile
+├── agent.py                  # Core agent — Gemini, Terraform, GCP queries
+├── ui.py                     # Streamlit UI
+├── Dockerfile                # Main app container
+├── docker-compose.yaml       # All services
+├── .env.example              # Environment template
 ├── auth-service/
-│   ├── auth_service.py       # JWT auth proxy
+│   ├── auth_service.py       # JWT auth proxy (FastAPI)
+│   ├── users.json            # User credentials
 │   └── Dockerfile
-└── terraform_files/          # Generated HCL, state, audit log
+└── terraform_files/          # Generated HCL, state, audit log (auto-created)
     ├── main.tf
     ├── provider.tf
+    ├── terraform.tfstate
     └── audit.jsonl
 ```
 
 ---
 
-## Built for
+## Voice commands
 
-[Gemini Live Agent Hackathon](https://geminiliveagentchallenge.devpost.com/) — March 2026
+Switch to the **Voice** tab, select a model, record, click **Transcribe**, then **Send to Agent**.
+
+Examples:
+
+```
+"create a VM type micro in us-central1 with Ubuntu 24"
+"create a GKE cluster with 3 nodes in europe-west1"
+"list all my VMs"
+"show recent error logs"
+"what is the disk size of vm prod-api"
+"remove bucket old-logs-bucket"
+"what is my billing summary"
+```
+
+---
+
+## Example chat commands
+
+```
+create a GCS bucket named ml-data in us-central1
+create a VM named web-server e2-medium us-central1
+create a GKE cluster with 2 nodes in asia-southeast1
+remove vm test-vm-01
+fix security issues
+show me all running VMs
+list all storage buckets
+show logs from the last 30 minutes
+rollback to previous version
+```
+
+---
+
+## Security
+
+- All traffic goes through the auth proxy — Streamlit is never exposed directly
+- JWT sessions with configurable TTL (default 8 hours)
+- Brute-force protection on login
+- Every apply is logged in the audit trail with user, timestamp, and resources changed
+- `terraform plan` is always shown before any `terraform apply`
+
+---
+
+## Supported GCP resources
+
+Compute VM · GKE cluster · GCS bucket · Cloud Run · Cloud Functions · VPC network · Firewall rules · BigQuery dataset + table · Cloud SQL · Pub/Sub · Load balancer · Cloud Armor
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| AI | Gemini 2.5 Flash / Gemini 3.1 Pro (Google AI) |
+| IaC | Terraform (hashicorp/google ~> 5.0) |
+| UI | Streamlit |
+| Auth | FastAPI + JWT |
+| State | GCS remote backend |
+| Container | Docker Compose |
+
+---
+
+## Hackathon
+
+Submitted to the **Gemini Live Agent Challenge** — [geminiliveagentchallenge.devpost.com](https://geminiliveagentchallenge.devpost.com/)
+
+Uses: Gemini AI · Google Cloud · Voice input · Terraform IaC · GCS state · Cloud Logging

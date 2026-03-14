@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+
+  # ── Auth Proxy ──────────────────────────────────────────────────────────────
+  # Sits in front of the SRE agent.
+  # ALL traffic enters here first. Validates JWT session cookie.
+  # Proxies authenticated requests to ai-sre-gcp on the internal network.
+  # Public port: 8080 (replaces direct Streamlit exposure)
+  auth:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: sre_auth
+    ports:
+      - "8080:8000"        # Public-facing: http://localhost:8080
+    environment:
+      # ── REQUIRED: Change this to a random 32+ char string ───────────────
+      AUTH_SECRET_KEY: "CHANGE-ME-generate-with-openssl-rand-hex-32"
+
+      # ── Where Streamlit lives (internal Docker network) ──────────────────
+      STREAMLIT_URL: "http://ai-sre-gcp:8080"
+
+      # ── Session settings ─────────────────────────────────────────────────
+      SESSION_TTL_HOURS: "8"
+      AUTH_REALM: "AI SRE Agent"
+
+      # Set to "true" if you put HTTPS in front (nginx/Caddy/Cloud Load Balancer)
+      COOKIE_SECURE: "false"
+
+      LOG_LEVEL: "INFO"
+    volumes:
+      # Mount your users file here — edit auth-service/users.json
+      - ./auth-service/users.json:/app/users.json:ro
+    depends_on:
+      - ai-sre-gcp
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── AI SRE Agent (Streamlit) ────────────────────────────────────────────────
+  # NO longer exposed directly on a public port.
+  # Only reachable from the auth service on the internal Docker network.
+  ai-sre-gcp:
+    build: .
+    container_name: sre_gemini_agent
+    env_file: .env
+    # !! Port removed — Streamlit is NOT publicly accessible anymore
+    # Only the auth service can reach it via the internal network
+    expose:
+      - "8080"
+    volumes:
+      - ./terraform_files:/app/terraform_files
+      # Uncomment if using GOOGLE_APPLICATION_CREDENTIALS:
+      # - ./gcp-credentials.json:/app/gcp-credentials.json:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+      - STREAMLIT_SERVER_PORT=8080
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  default:
+    name: ai_network

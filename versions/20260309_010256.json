@@ -1,0 +1,16 @@
+{
+  "version_id": "20260309_010256",
+  "ts": "2026-03-09T01:02:56.295748Z",
+  "label": "apply",
+  "user": "unknown",
+  "action": "apply",
+  "state_serial": 25,
+  "resource_count": 1,
+  "resources": [
+    {
+      "type": "google_compute_instance",
+      "name": "test-boto-1"
+    }
+  ],
+  "hcl": "\n\n# \u2500\u2500 added \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nresource \"google_compute_instance\" \"test-boto-1\" {\n  provider     = google.us_east1\n  name         = \"test-boto-1\"\n  machine_type = \"e2-micro\"\n  zone         = \"us-east1-b\"\n\n  boot_disk {\n    initialize_params {\n      image = \"debian-cloud/debian-12\"\n    }\n  }\n\n  network_interface {\n    network = \"default\"\n    access_config {\n      // Ephemeral public IP\n    }\n  }\n}\n"
+}

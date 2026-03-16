@@ -1,33 +1,18 @@
-# Use a lightweight Python image
 FROM python:3.11-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    unzip \
-    gnupg \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Terraform CLI
-ARG TF_VERSION=1.7.5
-RUN curl -LO https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip \
-    && unzip terraform_${TF_VERSION}_linux_amd64.zip \
-    && mv terraform /usr/local/bin/ \
-    && rm terraform_${TF_VERSION}_linux_amd64.zip
-
-# Set working directory
 WORKDIR /app
 
-# Copy requirements and install
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies
+RUN pip install --no-cache-dir \
+    fastapi==0.111.0 \
+    uvicorn[standard]==0.29.0 \
+    httpx==0.27.0 \
+    python-multipart==0.0.9 \
+    websockets==12.0
 
-# Copy the application
-COPY . .
+COPY auth_service.py .
 
-# Expose Streamlit port
-EXPOSE 8080
+EXPOSE 8000
 
-# Run the application
-CMD ["streamlit", "run", "ui.py", "--server.port=8080", "--server.address=0.0.0.0"]
+# --ws websockets  → tells uvicorn to use the websockets library for WS handling
+CMD ["uvicorn", "auth_service:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--ws", "websockets"]

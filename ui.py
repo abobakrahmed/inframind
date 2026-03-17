@@ -12,6 +12,7 @@ from agent import (
     force_unlock_state, start_state_push_job,
     estimate_plan_cost, audit_security, auto_fix_security,
     read_audit_log, get_version_history, start_rollback_job,
+    start_drift_job, start_drift_fix_job,
     start_voice_job,
 )
 
@@ -25,6 +26,76 @@ def get_current_user() -> str:
         return headers.get("X-Authenticated-User", "unknown")
     except Exception:
         return "unknown"
+
+def get_current_role() -> str:
+    """Read the role injected by the auth proxy (admin | viewer)."""
+    try:
+        return st.context.headers.get("X-User-Role", "viewer")
+    except Exception:
+        return "viewer"
+
+def require_admin(action: str = "this action") -> bool:
+    """
+    Returns True if current user is admin.
+    Shows a blocking error in the UI if not — call before any destructive action.
+    """
+    if get_current_role() == "admin":
+        return True
+    st.error(f"🔒 **Access denied** — {action} requires admin role. "
+             f"Contact your administrator.")
+    return False
+
+# ── Monitor Agent helpers ─────────────────────────────────────────────────────
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+_ui_redis  = None
+
+def _get_ui_redis():
+    global _ui_redis
+    if _ui_redis:
+        return _ui_redis
+    if not _REDIS_URL:
+        return None
+    try:
+        import redis as _r
+        _ui_redis = _r.from_url(_REDIS_URL, decode_responses=True)
+        _ui_redis.ping()
+    except Exception:
+        _ui_redis = None
+    return _ui_redis
+
+def _poll_monitor_alerts():
+    """
+    Non-blocking: drain unread alerts from Redis list 'sre:alerts:ui'
+    and heartbeat from 'sre:monitor:hb'. Called once per Streamlit rerun.
+    Monitor agent pushes to list; UI pops and stores in session_state.
+    """
+    rc = _get_ui_redis()
+    if not rc:
+        return
+    try:
+        # Drain up to 20 new alerts per render cycle
+        for _ in range(20):
+            raw = rc.lpop("sre:alerts:ui")
+            if not raw:
+                break
+            alert = json.loads(raw)
+            st.session_state.monitor_alerts.append(alert)
+        # Heartbeat (latest only)
+        hb_raw = rc.get("sre:monitor:hb")
+        if hb_raw:
+            st.session_state.monitor_hb = json.loads(hb_raw)
+    except Exception:
+        pass
+
+def _trigger_monitor_run():
+    """Tell the monitor agent to run a check immediately."""
+    rc = _get_ui_redis()
+    if rc:
+        try:
+            rc.publish("sre:monitor:commands",
+                       json.dumps({"action": "run_now"}))
+        except Exception:
+            pass
 
 st.markdown("""
 <style>
@@ -457,6 +528,9 @@ defaults = {
     "thinking":       False,
     "show_logs":      True,
     "rollback_job_id": None,
+    "drift_job_id":    None,
+    "drift_result":    None,
+    "drift_fix_job_id": None,
     "is_rollback":    False,
     "rollback_version": None,
     # ── Voice ──────────────────────────────────────────────────────────────────
@@ -465,6 +539,9 @@ defaults = {
     "voice_model_ok":  None,
     "voice_model":     None,  # None = use VOICE_MODEL env default
     "voice_audio_bytes": None, # persisted bytes from st.audio_input across rerun
+    # ── Monitor Agent ──────────────────────────────────────────────────────────
+    "monitor_alerts":  [],    # list of unread alert dicts from monitor agent
+    "monitor_hb":      None,  # last heartbeat from monitor agent
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -518,6 +595,15 @@ if st.session_state.ready_to_apply and st.session_state.plan_ts:
 # TOP HEADER
 # ─────────────────────────────────────────────────────────────────────────────
 project_display = GCP_PROJECT_ID or "⚠️ GCP_PROJECT_ID not set"
+_current_user = get_current_user()
+_current_role = get_current_role()
+_role_badge   = (
+    "<span style='background:#0d2818;border:1px solid #2ea043;color:#3fb950;"
+    "font-size:0.58rem;padding:1px 7px;border-radius:10px;margin-left:5px;font-weight:600'>ADMIN</span>"
+    if _current_role == "admin" else
+    "<span style='background:#1a1a2e;border:1px solid #30363d;color:#8b949e;"
+    "font-size:0.58rem;padding:1px 7px;border-radius:10px;margin-left:5px;font-weight:600'>VIEWER</span>"
+)
 st.markdown(f"""
 <div style='display:flex; align-items:center; padding:10px 20px;
             border-bottom:1px solid #21262d; background:#0d1117;
@@ -531,6 +617,17 @@ st.markdown(f"""
                  font-family:"JetBrains Mono"'>{GEMINI_MODEL} · GCP · Terraform</span>
     <span style='margin-left:12px; color:#79c0ff; font-size:0.68rem;
                  font-family:"JetBrains Mono"'>🏗️ {project_display}</span>
+    <span style='margin-left:16px; color:#8b949e; font-size:0.68rem;
+                 font-family:"JetBrains Mono"'>👤 {_current_user}</span>{_role_badge}
+    <a href="/logout" style='margin-left:12px; background:#1a1a2e; border:1px solid #30363d;
+                 color:#f85149; font-size:0.65rem; padding:3px 10px;
+                 border-radius:6px; text-decoration:none; font-family:"JetBrains Mono";
+                 font-weight:600; letter-spacing:0.03em;
+                 transition:border-color 0.2s'
+       onmouseover="this.style.borderColor='#f85149'"
+       onmouseout="this.style.borderColor='#30363d'">
+        ⏏ Sign Out
+    </a>
 </div>
 """, unsafe_allow_html=True)
 
@@ -896,6 +993,73 @@ with col_right:
                     f"{'<br><span style=color:#8b949e>' + detail_str + '</span>' if detail_str else ''}"
                     f"</div>", unsafe_allow_html=True)
 
+    # ── Monitor Agent Alerts ───────────────────────────────────────────────────
+    _poll_monitor_alerts()   # pull new alerts from Redis (non-blocking)
+    _hb   = st.session_state.monitor_hb
+    _mals = st.session_state.monitor_alerts
+
+    _hb_dot   = "🟢" if _hb and _hb.get("healthy") else ("🔴" if _hb else "⚪")
+    _mal_badge = f" ({len(_mals)})" if _mals else ""
+    with st.expander(f"{_hb_dot} Monitor Agent{_mal_badge}", expanded=bool(_mals)):
+        if _hb:
+            st.markdown(
+                f"<div style='font-family:JetBrains Mono;font-size:0.6rem;color:#484f58;"
+                f"margin-bottom:6px'>"
+                f"🖥️ {_hb.get('vm_count',0)} VMs &nbsp;·&nbsp; "
+                f"🪣 {_hb.get('bkt_count',0)} buckets &nbsp;·&nbsp; "
+                f"⚠️ {_hb.get('err_rate',0):.1f} err/min &nbsp;·&nbsp; "
+                f"last poll {(_hb.get('ts',''))[11:19]} UTC</div>",
+                unsafe_allow_html=True)
+        else:
+            st.caption("Monitor agent not connected — check docker-compose.")
+
+        if _mals:
+            sev_col = {"critical": "#f85149", "high": "#f0883e",
+                       "medium":   "#e3b341", "low":  "#4d9eff"}
+            sev_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
+            for i, al in enumerate(_mals[-10:]):
+                sev   = al.get("severity", "medium")
+                color = sev_col.get(sev, "#4d9eff")
+                icon  = sev_icon.get(sev, "⚪")
+                ts    = al.get("ts", "")
+                ts_s  = ts[11:19] if len(ts) > 18 else ts
+                action_html = ""
+                if al.get("suggested_action"):
+                    action_html = (
+                        "<div style='font-size:0.65rem;color:#3fb950;margin-top:3px'>💡 "
+                        + al.get("suggested_action", "")
+                        + "</div>"
+                    )
+                st.markdown(
+                    f"<div style='background:#0d1117;border-left:3px solid {color};"
+                    f"border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:5px'>"
+                    f"<div style='font-family:JetBrains Mono;font-size:0.65rem;"
+                    f"color:{color};font-weight:600'>{icon} {al.get('title','')}"
+                    f"<span style='float:right;color:#484f58;font-weight:400'>{ts_s}</span></div>"
+                    f"<div style='font-size:0.72rem;color:#8b949e;margin-top:2px'>"
+                    f"{al.get('body','')}</div>"
+                    f"{action_html}"
+                    f"</div>",
+                    unsafe_allow_html=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🗑️ Clear alerts", key="clear_mon_alerts",
+                             use_container_width=True):
+                    st.session_state.monitor_alerts = []
+                    st.rerun()
+            with c2:
+                if st.button("▶ Run now", key="mon_run_now",
+                             use_container_width=True):
+                    _trigger_monitor_run()
+                    st.rerun()
+        else:
+            st.caption("No active alerts — infrastructure looks healthy.")
+            if st.button("▶ Run check now", key="mon_run_now2",
+                         use_container_width=True):
+                _trigger_monitor_run()
+                st.rerun()
+
     # ── Version History & Rollback ─────────────────────────────────────────────
     with st.expander("⏪ Version History", expanded=False):
         versions = get_version_history()
@@ -973,6 +1137,114 @@ with col_right:
                 elif is_current:
                     st.caption("  ↳ This is the current version")
                 st.markdown("---" if not is_current else "", unsafe_allow_html=True)
+
+    # ── Drift Detection ───────────────────────────────────────────────────────
+    with st.expander("🔀 Drift Detection", expanded=False):
+        st.markdown(
+            "<div style='font-family:JetBrains Mono;font-size:0.65rem;color:#484f58;"
+            "line-height:1.7;margin-bottom:8px'>"
+            "Detect resources manually deleted or modified in GCP console."
+            "</div>", unsafe_allow_html=True)
+
+        # Poll drift fix job
+        _dfix_jid = st.session_state.drift_fix_job_id
+        if _dfix_jid:
+            _dj = get_job(_dfix_jid)
+            if _dj.get("status") == "running":
+                st.info("⏳ Fixing drift…")
+            elif _dj.get("status") in ("done", "error"):
+                msg = (_dj.get("result") or {}).get("message", "")
+                if _dj.get("status") == "done":
+                    st.success(msg)
+                else:
+                    st.error(msg)
+                st.session_state.drift_fix_job_id = None
+                st.session_state.drift_result     = None
+
+        # Poll drift detection job
+        _drift_jid = st.session_state.drift_job_id
+        if _drift_jid:
+            _dj = get_job(_drift_jid)
+            if _dj.get("status") == "running":
+                st.info("⏳ Scanning for drift…")
+                import time as _t; _t.sleep(1); st.rerun()
+            elif _dj.get("status") == "done":
+                st.session_state.drift_result  = (_dj.get("result") or {}).get("drift")
+                st.session_state.drift_job_id  = None
+                st.rerun()
+            elif _dj.get("status") == "error":
+                st.error((_dj.get("result") or {}).get("message","Drift scan failed."))
+                st.session_state.drift_job_id = None
+
+        _drift = st.session_state.drift_result
+
+        # Show scan button when no result yet
+        if not _drift and not _drift_jid:
+            if st.button("🔍 Scan for Drift", key="drift_scan",
+                         use_container_width=True,
+                         disabled=st.session_state.thinking):
+                st.session_state.drift_job_id = start_drift_job(
+                    user=get_current_user())
+                st.rerun()
+
+        # Show results
+        if _drift:
+            if _drift.get("clean"):
+                st.markdown(
+                    "<div style='font-family:JetBrains Mono;font-size:0.7rem;"
+                    "color:#3fb950;padding:6px 0'>✅ No drift — GCP matches state</div>",
+                    unsafe_allow_html=True)
+            else:
+                deleted  = _drift.get("deleted", [])
+                modified = _drift.get("modified", [])
+
+                if deleted:
+                    st.markdown(
+                        f"<div style='font-family:JetBrains Mono;font-size:0.67rem;"
+                        f"color:#f85149;margin:4px 0'>"
+                        f"🗑️ <b>{len(deleted)} deleted</b> in GCP console:</div>",
+                        unsafe_allow_html=True)
+                    for r in deleted:
+                        st.markdown(
+                            f"<div style='font-family:JetBrains Mono;font-size:0.62rem;"
+                            f"color:#ff7b72;padding:2px 0 2px 10px'>"
+                            f"• {r['address']}</div>",
+                            unsafe_allow_html=True)
+
+                if modified:
+                    st.markdown(
+                        f"<div style='font-family:JetBrains Mono;font-size:0.67rem;"
+                        f"color:#d29922;margin:4px 0'>"
+                        f"✏️ <b>{len(modified)} modified</b> outside Terraform:</div>",
+                        unsafe_allow_html=True)
+                    for r in modified:
+                        st.markdown(
+                            f"<div style='font-family:JetBrains Mono;font-size:0.62rem;"
+                            f"color:#e3b341;padding:2px 0 2px 10px'>"
+                            f"• {r['address']}</div>",
+                            unsafe_allow_html=True)
+
+                st.markdown("<div style='margin:8px 0'></div>", unsafe_allow_html=True)
+                _fc1, _fc2 = st.columns(2)
+                with _fc1:
+                    if st.button("🧹 Accept deletions\n(clean state)",
+                                 key="drift_accept", use_container_width=True,
+                                 disabled=not deleted):
+                        st.session_state.drift_fix_job_id = start_drift_fix_job(
+                            _drift, "remove_state", user=get_current_user())
+                        st.rerun()
+                with _fc2:
+                    if st.button("🔄 Reconcile state\n(sync to GCP)",
+                                 key="drift_reconcile", use_container_width=True):
+                        st.session_state.drift_fix_job_id = start_drift_fix_job(
+                            _drift, "reconcile", user=get_current_user())
+                        st.rerun()
+
+            # Rescan button
+            if st.button("🔁 Re-scan", key="drift_rescan", use_container_width=True):
+                st.session_state.drift_result = None
+                st.session_state.drift_job_id = start_drift_job(user=get_current_user())
+                st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1305,16 +1577,16 @@ with col_chat:
             with fix_cols[0]:
                 fix_label = f"🔒 Fix {len(_fixable_ids)} Security Issue(s)"
                 if st.button(fix_label, key="action_fix_security", use_container_width=True):
-                    # Send "fix security ALL" as next agent message
-                    fix_msg = f"fix security issues: {', '.join(_fixable_ids)}"
-                    st.session_state.messages.append({"role": "user", "content": fix_msg})
-                    st.session_state.agent_job_id   = start_agent_job(
-                        st.session_state.messages.copy(), user=get_current_user())
-                    st.session_state.ready_to_apply = False
-                    st.session_state.plan_ts        = None
-                    st.session_state.thinking       = True
-                    st.session_state["_last_action"]= None
-                    st.rerun()
+                    if require_admin("fixing security issues"):
+                        fix_msg = f"fix security issues: {', '.join(_fixable_ids)}"
+                        st.session_state.messages.append({"role": "user", "content": fix_msg})
+                        st.session_state.agent_job_id   = start_agent_job(
+                            st.session_state.messages.copy(), user=get_current_user())
+                        st.session_state.ready_to_apply = False
+                        st.session_state.plan_ts        = None
+                        st.session_state.thinking       = True
+                        st.session_state["_last_action"]= None
+                        st.rerun()
 
         btn_cols = st.columns([2, 2, 6])
 
@@ -1347,15 +1619,16 @@ with col_chat:
                     rv = st.session_state.rollback_version or {}
                     label = f"⏪ Confirm Rollback → {rv.get('version_id','')[:15]}"
                 if st.button(label, key="action_apply", use_container_width=True):
-                    st.session_state.apply_job_id     = start_apply_job(user=get_current_user())
-                    st.session_state.ready_to_apply   = False
-                    st.session_state.plan_ts          = None
-                    st.session_state.is_rollback      = False
-                    st.session_state.rollback_version = None
-                    st.session_state["_last_action"]  = None
-                    if _action_idx < len(st.session_state.messages):
-                        st.session_state.messages[_action_idx].pop("action", None)
-                    st.rerun()
+                    if require_admin("applying infrastructure changes"):
+                        st.session_state.apply_job_id     = start_apply_job(user=get_current_user())
+                        st.session_state.ready_to_apply   = False
+                        st.session_state.plan_ts          = None
+                        st.session_state.is_rollback      = False
+                        st.session_state.rollback_version = None
+                        st.session_state["_last_action"]  = None
+                        if _action_idx < len(st.session_state.messages):
+                            st.session_state.messages[_action_idx].pop("action", None)
+                        st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
             with btn_cols[1]:
                 if st.button("❌ Discard Plan", key="action_discard_apply",
@@ -1367,16 +1640,17 @@ with col_chat:
             with btn_cols[0]:
                 st.markdown('<div class="btn-destroy">', unsafe_allow_html=True)
                 if st.button("💣 Confirm Destroy", key="action_destroy", use_container_width=True):
-                    st.session_state.apply_job_id   = start_apply_job(
-                        is_destroy=True,
-                        destroy_target=st.session_state.destroy_target,
-                        user=get_current_user())
-                    st.session_state.ready_to_apply = False
-                    st.session_state.plan_ts        = None
-                    st.session_state["_last_action"]= None
-                    if _action_idx < len(st.session_state.messages):
-                        st.session_state.messages[_action_idx].pop("action", None)
-                    st.rerun()
+                    if require_admin("destroying infrastructure"):
+                        st.session_state.apply_job_id   = start_apply_job(
+                            is_destroy=True,
+                            destroy_target=st.session_state.destroy_target,
+                            user=get_current_user())
+                        st.session_state.ready_to_apply = False
+                        st.session_state.plan_ts        = None
+                        st.session_state["_last_action"]= None
+                        if _action_idx < len(st.session_state.messages):
+                            st.session_state.messages[_action_idx].pop("action", None)
+                        st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
             with btn_cols[1]:
                 if st.button("❌ Cancel", key="action_cancel_d", use_container_width=True):
@@ -1387,13 +1661,14 @@ with col_chat:
             with btn_cols[0]:
                 st.markdown('<div class="btn-destroy">', unsafe_allow_html=True)
                 if st.button("⚠️ Apply Anyway", key="action_warn", use_container_width=True):
-                    st.session_state.apply_job_id   = start_apply_job(user=get_current_user())
-                    st.session_state.ready_to_apply = False
-                    st.session_state.plan_ts        = None
-                    st.session_state["_last_action"]= None
-                    if _action_idx < len(st.session_state.messages):
-                        st.session_state.messages[_action_idx].pop("action", None)
-                    st.rerun()
+                    if require_admin("applying destructive changes"):
+                        st.session_state.apply_job_id   = start_apply_job(user=get_current_user())
+                        st.session_state.ready_to_apply = False
+                        st.session_state.plan_ts        = None
+                        st.session_state["_last_action"]= None
+                        if _action_idx < len(st.session_state.messages):
+                            st.session_state.messages[_action_idx].pop("action", None)
+                        st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
             with btn_cols[1]:
                 if st.button("❌ Cancel", key="action_cancel_w", use_container_width=True):
@@ -1567,7 +1842,7 @@ with col_chat:
     # ── Tab: Voice ────────────────────────────────────────────────────────────
     with tab_voice:
         # ── Model selector ────────────────────────────────────────────────
-        _VOICE_MODELS = ["gemini-2.5-flash"]
+        _VOICE_MODELS = ["gemini-2.5-flash-preview-04-17", "gemini-2.0-flash-lite", "gemini-2.5-pro-preview-03-25"]
         if st.session_state.voice_model is None:
             _default_idx = (_VOICE_MODELS.index(VOICE_MODEL)
                             if VOICE_MODEL in _VOICE_MODELS else 0)

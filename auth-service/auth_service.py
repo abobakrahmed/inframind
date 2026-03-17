@@ -83,17 +83,84 @@ def _get_active_sessions() -> list:
         return list(_active_sessions.values())
 
 # ── Users ─────────────────────────────────────────────────────────────────────
+def _fetch_secret(secret_name: str) -> str:
+    """
+    Fetch a secret value from GCP Secret Manager using the metadata server
+    or service account credentials — no extra SDK needed.
+    Returns empty string if unavailable.
+    """
+    import urllib.request
+    project = os.environ.get("GCP_PROJECT_ID", "")
+    if not project:
+        return ""
+    try:
+        # Get access token from metadata server (works inside Cloud Run automatically)
+        token_req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+            headers={"Metadata-Flavor": "Google"})
+        token_resp = json.loads(urllib.request.urlopen(token_req, timeout=3).read())
+        access_token = token_resp.get("access_token", "")
+        if not access_token:
+            return ""
+
+        # Fetch the secret version
+        url = (f"https://secretmanager.googleapis.com/v1/projects/{project}"
+               f"/secrets/{secret_name}/versions/latest:access")
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+        resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        # Secret Manager returns base64-encoded payload
+        encoded = resp.get("payload", {}).get("data", "")
+        return base64.b64decode(encoded).decode("utf-8") if encoded else ""
+    except Exception as exc:
+        log.debug(f"Secret Manager fetch '{secret_name}': {exc}")
+        return ""
+
+
 def _load_users() -> list[dict]:
+    """
+    Load users from (in priority order):
+    1. GCP Secret Manager  — secret name: sre-auth-users
+    2. AUTH_USERS env var  — JSON string
+    3. ADMIN_PASSWORD env  — single admin user
+    4. users.json file     — local fallback for docker-compose
+    """
+    # 1. Secret Manager (production — Cloud Run)
+    raw_sm = _fetch_secret("sre-auth-users")
+    if raw_sm:
+        try:
+            users = json.loads(raw_sm)
+            log.info(f"✅ Loaded {len(users)} user(s) from Secret Manager")
+            return users
+        except Exception as exc:
+            log.warning(f"Secret Manager users parse error: {exc}")
+
+    # 2. AUTH_USERS env var (docker-compose / testing)
+    raw_env = os.environ.get("AUTH_USERS", "")
+    if raw_env:
+        try:
+            users = json.loads(raw_env)
+            log.info(f"✅ Loaded {len(users)} user(s) from AUTH_USERS env")
+            return users
+        except Exception as exc:
+            log.warning(f"AUTH_USERS parse error: {exc}")
+
+    # 3. ADMIN_PASSWORD env var — single admin shortcut
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "")
+    if admin_pass:
+        log.info("✅ Using ADMIN_PASSWORD env var")
+        return [{"username": "admin", "password": admin_pass, "role": "admin"}]
+
+    # 4. Local users.json file (docker-compose default)
     users_file = os.environ.get("USERS_FILE", "/app/users.json")
     if os.path.exists(users_file):
         with open(users_file) as f:
-            return json.load(f)
-    raw = os.environ.get("AUTH_USERS", "")
-    if raw:
-        return json.loads(raw)
-    admin_pass = os.environ.get("ADMIN_PASSWORD", "admin")
-    log.warning("⚠️  Using fallback admin — set AUTH_USERS or ADMIN_PASSWORD")
-    return [{"username": "admin", "password": admin_pass, "role": "admin"}]
+            users = json.load(f)
+            log.info(f"✅ Loaded {len(users)} user(s) from {users_file}")
+            return users
+
+    # Final fallback — warn loudly
+    log.warning("⚠️  No users found — using insecure default. Set sre-auth-users secret!")
+    return [{"username": "admin", "password": "changeme123", "role": "admin"}]
 
 def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -390,6 +457,21 @@ async def ws_proxy(websocket: WebSocket):
 
 _BYPASS_AUTH = {"/_stcore/", "/static/", "/vendor/", "/favicon."}
 
+def _get_identity_token(audience: str) -> str:
+    """
+    Get a Cloud Run identity token for service-to-service auth.
+    Works automatically inside Cloud Run via the metadata server.
+    """
+    try:
+        import urllib.request as _ur
+        url = (f"http://metadata.google.internal/computeMetadata/v1/instance"
+               f"/service-accounts/default/identity?audience={audience}&format=full")
+        req = _ur.Request(url, headers={"Metadata-Flavor": "Google"})
+        return _ur.urlopen(req, timeout=3).read().decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
 @app.api_route("/{full_path:path}",
                methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"])
 async def http_proxy(request: Request, full_path: str):
@@ -424,6 +506,12 @@ async def http_proxy(request: Request, full_path: str):
     fwd_headers["X-Forwarded-For"]   = request.client.host if request.client else ""
     fwd_headers["X-Forwarded-Proto"] = request.url.scheme
 
+    # Add Cloud Run identity token so the internal Streamlit service
+    # accepts requests (required when --no-allow-unauthenticated is set)
+    id_token = _get_identity_token(STREAMLIT_URL)
+    if id_token:
+        fwd_headers["Authorization"] = f"Bearer {id_token}"
+
     body = await request.body()
 
     try:
@@ -451,3 +539,4 @@ async def http_proxy(request: Request, full_path: str):
             f"<h3 style='font-family:monospace;color:#f85149;padding:40px'>"
             f"Proxy error: {exc}</h3>",
             status_code=502)
+

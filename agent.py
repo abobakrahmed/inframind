@@ -20,7 +20,7 @@ GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 # NOTE: Update GEMINI_MODEL env var to override if a newer model is released.
 GEMINI_MODEL       = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 # Audio transcription model — must support audio via generate_content (NOT Live API).
-# Valid options: gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro
+# Valid options: gemini-2.5-flash-preview-04-17, gemini-2.0-flash-lite, gemini-2.5-pro-preview-03-25
 # Do NOT use gemini-2.5-flash-preview-native-audio-dialog (Live API only, hangs via REST).
 VOICE_MODEL        = os.environ.get("VOICE_MODEL", "gemini-2.5-flash")
 
@@ -2976,6 +2976,166 @@ def start_agent_job(messages: list, user: str = "unknown") -> str:
         JOBS[jid]["_user"]     = user
     threading.Thread(target=_agent_worker, args=(jid, messages), daemon=True).start()
     return jid
+
+
+# ---------------------------------------------------------------------------
+# Drift Detection Engine
+# Compares terraform state against live GCP resources via REST API.
+# Detects: deleted resources (ghost state), modified resources (config drift).
+# ---------------------------------------------------------------------------
+
+def detect_drift(jid: str) -> dict:
+    """
+    Run terraform plan -refresh-only to detect drift between state and GCP.
+    Returns structured drift report: {drifted: [...], deleted: [...], clean: bool}
+    """
+    _log(jid, "🔄 Running drift detection (terraform plan -refresh-only)…")
+
+    # First refresh state from GCP
+    res = subprocess.run(
+        ["terraform", "plan", "-refresh-only", "-no-color"],
+        cwd=TF_DIR, capture_output=True, text=True, timeout=120
+    )
+    output = res.stdout + res.stderr
+
+    drift_report = {
+        "clean":    False,
+        "deleted":  [],   # resources in state but gone from GCP
+        "modified": [],   # resources that changed outside Terraform
+        "summary":  "",
+        "raw_plan": output[:3000],
+    }
+
+    if "No changes" in output and "state is up-to-date" in output.lower() or \
+       "Your infrastructure matches the configuration" in output:
+        drift_report["clean"]   = True
+        drift_report["summary"] = "✅ No drift detected — GCP matches Terraform state."
+        _log(jid, "✅ No drift.")
+        return drift_report
+
+    # Parse deleted resources (gone from GCP but still in state)
+    # Terraform shows these as: "- resource_type.resource_name" with "has been deleted"
+    for line in output.splitlines():
+        clean = line.strip().lstrip("│ ").strip()
+
+        # Deleted: "google_compute_instance.vm-prod has been deleted"
+        m_del = re.search(
+            r'([\w.]+)\s+has been deleted|'
+            r'([\w.]+)\s+no longer exists|'
+            r'Resource\s+([\w.]+)\s+.*deleted',
+            clean, re.IGNORECASE)
+        if m_del:
+            name = (m_del.group(1) or m_del.group(2) or m_del.group(3) or "").strip()
+            if name and "." in name and name not in [d["address"] for d in drift_report["deleted"]]:
+                parts = name.split(".", 1)
+                drift_report["deleted"].append({
+                    "address":       name,
+                    "resource_type": parts[0],
+                    "resource_name": parts[1] if len(parts) > 1 else name,
+                    "action":        "deleted_outside_terraform",
+                })
+
+        # Modified: lines with "~" (update-in-place drift)
+        m_mod = re.match(r'~\s+([\w.]+)', clean)
+        if m_mod:
+            name = m_mod.group(1).strip()
+            if name and "." in name and name not in [m["address"] for m in drift_report["modified"]]:
+                drift_report["modified"].append({
+                    "address": name,
+                    "action":  "modified_outside_terraform",
+                })
+
+    n_del = len(drift_report["deleted"])
+    n_mod = len(drift_report["modified"])
+
+    if n_del == 0 and n_mod == 0 and res.returncode != 0:
+        # Plan errored — state is likely broken
+        drift_report["summary"] = (
+            f"⚠️ Terraform plan error — state may be corrupted.\n"
+            f"Run: terraform state list\nError:\n{output[-500:]}"
+        )
+    else:
+        parts = []
+        if n_del: parts.append(f"🗑️ {n_del} resource(s) deleted from GCP console")
+        if n_mod: parts.append(f"✏️ {n_mod} resource(s) modified outside Terraform")
+        drift_report["summary"] = "\n".join(parts) or "⚠️ Drift detected — see plan output."
+
+    _log(jid, f"⚠️ Drift: {n_del} deleted, {n_mod} modified")
+    return drift_report
+
+
+def _fix_drift(drift: dict, action: str, jid: str) -> str:
+    """
+    Fix drift based on chosen action.
+    action: "remove_state"  — remove deleted resources from state (accept the deletion)
+            "reconcile"     — terraform apply -refresh-only (sync state to GCP reality)
+    """
+    if action == "remove_state":
+        results = []
+        for r in drift.get("deleted", []):
+            addr = r["address"]
+            _log(jid, f"🗑️ Removing {addr} from state…")
+            res = subprocess.run(
+                ["terraform", "state", "rm", addr],
+                cwd=TF_DIR, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                results.append(f"✅ Removed {addr} from state")
+            else:
+                results.append(f"❌ Failed to remove {addr}: {res.stderr[:100]}")
+        return "\n".join(results) or "Nothing to remove."
+
+    elif action == "reconcile":
+        _log(jid, "🔄 Applying refresh-only to sync state…")
+        res = subprocess.run(
+            ["terraform", "apply", "-refresh-only", "-auto-approve", "-no-color"],
+            cwd=TF_DIR, capture_output=True, text=True, timeout=120)
+        if res.returncode == 0:
+            return "✅ State reconciled — Terraform now reflects GCP reality."
+        return f"❌ Reconcile failed:\n{res.stderr[:300]}"
+
+    return "Unknown action."
+
+
+def start_drift_job(user: str = "unknown") -> str:
+    """Start an async drift detection job. Returns job ID."""
+    jid = _new_job()
+    with JOBS_LOCK:
+        JOBS[jid]["_job_type"] = "drift"
+        JOBS[jid]["_user"]     = user
+
+    def _worker():
+        try:
+            init = TerraformTools.run_init(jid)
+            if init != "ok":
+                _error(jid, f"❌ Init failed: {init}")
+                return
+            drift = detect_drift(jid)
+            _finish(jid, {"status": "success", "drift": drift,
+                          "message": drift["summary"]})
+        except Exception as exc:
+            _error(jid, f"❌ Drift detection failed: {exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jid
+
+
+def start_drift_fix_job(drift: dict, action: str, user: str = "unknown") -> str:
+    """Start an async drift fix job."""
+    jid = _new_job()
+    with JOBS_LOCK:
+        JOBS[jid]["_job_type"] = "drift_fix"
+        JOBS[jid]["_user"]     = user
+
+    def _worker():
+        try:
+            result = _fix_drift(drift, action, jid)
+            _finish(jid, {"status": "success", "message": result})
+        except Exception as exc:
+            _error(jid, f"❌ Drift fix failed: {exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jid
+
 
 def start_voice_job(audio_bytes: bytes, mime_type: str = "audio/wav",
                     model: str = None,

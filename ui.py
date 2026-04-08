@@ -2,6 +2,7 @@ import re
 import time
 import json
 import os
+from datetime import datetime
 import streamlit as st
 from agent import (
     start_agent_job, start_apply_job, get_job,
@@ -14,7 +15,29 @@ from agent import (
     read_audit_log, get_version_history, start_rollback_job,
     start_drift_job, start_drift_fix_job,
     start_voice_job,
+    start_deploy_job,
 )
+
+# ── Block direct browser access (allow only from auth proxy) ─────────────────
+_INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
+if _INTERNAL_SECRET:
+    try:
+        _got = st.context.headers.get("X-Internal-Secret", "")
+        # Also accept via query param (used by WebSocket upgrade path)
+        if not _got:
+            _got = st.query_params.get("_int", "")
+    except Exception:
+        _got = ""
+    if _got != _INTERNAL_SECRET:
+        st.set_page_config(page_title="403 Forbidden", layout="centered")
+        st.markdown(
+            "<div style='text-align:center;padding:20vh 0;font-family:monospace'>"
+            "<div style='font-size:3rem'>🔒</div>"
+            "<div style='font-size:1.4rem;color:#f85149;margin:8px 0'>403 Forbidden</div>"
+            "<div style='color:#6e7681'>Access only via the authorised entry point.</div>"
+            "</div>", unsafe_allow_html=True)
+        st.stop()
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="AI SRE Agent — GCP", layout="wide", page_icon="☁️",
                    initial_sidebar_state="collapsed")
@@ -99,201 +122,243 @@ def _trigger_monitor_run():
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 
-* { font-family: 'Inter', sans-serif; box-sizing: border-box; }
-.stApp { background: #0d1117; }
+*, *::before, *::after { box-sizing: border-box; }
+body, .stApp { background: #09090B !important; font-family: 'Inter', sans-serif; }
 .block-container { padding: 0 !important; max-width: 100% !important; }
-section[data-testid="stSidebar"] { display: none; }
-header[data-testid="stHeader"]   { display: none; }
-#MainMenu, footer                { display: none; }
+section[data-testid="stSidebar"], header[data-testid="stHeader"],
+#MainMenu, footer { display: none !important; }
 .stTextArea label, .stTextInput label { display: none; }
 
-::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar { width: 3px; height: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: #3F3F46; border-radius: 3px; }
 
-.msg-row-user      { display:flex; justify-content:flex-end;  margin:6px 16px; }
-.msg-row-assistant { display:flex; justify-content:flex-start; margin:6px 16px; }
+/* ── Messages ── */
+.msg-row-user      { display:flex; justify-content:flex-end;  margin:4px 12px; }
+.msg-row-assistant { display:flex; justify-content:flex-start; margin:4px 12px; }
 
 .bubble-user {
-    background: #1565c0;
-    color: #fff;
+    background: #4F46E5;
+    color: #EEF2FF;
     border-radius: 16px 16px 4px 16px;
-    padding: 9px 14px;
-    max-width: 72%;
+    padding: 10px 15px;
+    max-width: 68%;
     font-size: 0.875rem;
-    line-height: 1.55;
+    line-height: 1.6;
     word-break: break-word;
 }
 .bubble-assistant {
-    background: #161b22;
-    color: #e6edf3;
-    border: 1px solid #30363d;
+    background: #18181B;
+    color: #E4E4E7;
+    border: 0.5px solid #3F3F46;
     border-radius: 16px 16px 16px 4px;
-    padding: 9px 14px;
-    max-width: 82%;
+    padding: 10px 15px;
+    max-width: 80%;
     font-size: 0.875rem;
-    line-height: 1.55;
+    line-height: 1.6;
     word-break: break-word;
 }
-.bubble-warning { background:#2d1f00; border-color:#d29922 !important; color:#f0c84a; }
-.bubble-error   { background:#2d0f0f; border-color:#f85149 !important; color:#ff7b72; }
-.bubble-success { background:#0d2818; border-color:#2ea043 !important; color:#56d364; }
+.bubble-warning { background:#1C1400; border-color:#78350F !important; color:#FDE68A; }
+.bubble-error   { background:#1A0505; border-color:#7F1D1D !important; color:#FCA5A5; }
+.bubble-success { background:#052E1A; border-color:#14532D !important; color:#86EFAC; }
 
+/* ── Thinking dots ── */
 .thinking-dot {
-    display:inline-block; width:6px; height:6px;
-    background:#8b949e; border-radius:50%; margin:0 2px;
-    animation: blink 1.2s infinite;
+    display:inline-block; width:5px; height:5px;
+    background:#6366F1; border-radius:50%; margin:0 2px;
+    animation: blink 1.4s infinite;
 }
 .thinking-dot:nth-child(2) { animation-delay:0.2s; }
 .thinking-dot:nth-child(3) { animation-delay:0.4s; }
-@keyframes blink { 0%,80%,100%{opacity:0.2} 40%{opacity:1} }
+@keyframes blink { 0%,80%,100%{opacity:0.15} 40%{opacity:1} }
 
-.log-box {
-    background: #0d1117;
-    border: 1px solid #21262d;
+/* ── Log box ── */
+.log-box, .log-box-live {
+    background: #09090B;
+    border: 0.5px solid #27272A;
     border-radius: 8px;
     padding: 10px 14px;
     font-family: 'JetBrains Mono', monospace;
-    font-size: 0.75rem;
-    color: #8b949e;
-    max-height: 220px;
+    font-size: 0.72rem;
+    color: #71717A;
+    max-height: 200px;
+    height: 200px;
     overflow-y: auto;
-    margin-top: 6px;
     white-space: pre-wrap;
     word-break: break-all;
 }
-.log-line-ok   { color: #3fb950; }
-.log-line-err  { color: #f85149; }
-.log-line-warn { color: #d29922; }
-.log-line-info { color: #79c0ff; }
+.log-line-ok   { color: #4ADE80; }
+.log-line-err  { color: #F87171; }
+.log-line-warn { color: #FCD34D; }
+.log-line-info { color: #818CF8; }
 
+/* ── Resource cards ── */
 .res-card {
-    background: #161b22;
-    border: 1px solid #30363d;
+    background: #18181B;
+    border: 0.5px solid #27272A;
     border-radius: 8px;
-    padding: 9px 13px;
-    margin: 5px 0;
+    padding: 8px 12px;
+    margin: 4px 0;
     display: flex;
     align-items: center;
-    gap: 9px;
-    font-size: 0.8rem;
+    gap: 8px;
+    font-size: 0.78rem;
 }
-.res-card.pending { border-color: #9e6a03; }
-.res-card.running { border-color: #2ea043; }
-.res-name { color: #e6edf3; font-family:'JetBrains Mono'; font-weight:500; flex:1; }
-.res-type { color: #484f58; font-family:'JetBrains Mono'; font-size:0.7rem; }
+.res-card.pending { border-color: #78350F; }
+.res-card.running { border-color: #14532D; }
+.res-name { color: #F4F4F5; font-family:'JetBrains Mono'; font-weight:500; flex:1; }
+.res-type { color: #52525B; font-family:'JetBrains Mono'; font-size:0.68rem; }
 
+/* ── Badges ── */
 .badge {
-    display:inline-block; padding:2px 10px; border-radius:20px;
-    font-size:0.68rem; font-weight:600; letter-spacing:0.03em;
+    display:inline-block; padding:1px 8px; border-radius:20px;
+    font-size:0.65rem; font-weight:600; letter-spacing:0.04em;
     font-family:'JetBrains Mono';
 }
-.badge-green  { background:#0d2818; color:#3fb950; border:1px solid #2ea043; }
-.badge-yellow { background:#2d1f00; color:#d29922; border:1px solid #9e6a03; }
-.badge-red    { background:#2d0f0f; color:#f85149; border:1px solid #f85149; }
+.badge-green  { background:#052E1A; color:#4ADE80; border:0.5px solid #14532D; }
+.badge-yellow { background:#1C1400; color:#FCD34D; border:0.5px solid #78350F; }
+.badge-red    { background:#1A0505; color:#F87171; border:0.5px solid #7F1D1D; }
+.badge-indigo { background:#1E1B4B; color:#818CF8; border:0.5px solid #3730A3; }
 
+/* ── Buttons ── */
 .stButton > button {
-    background: #21262d; color: #e6edf3;
-    border: 1px solid #30363d; border-radius: 8px;
-    font-size: 0.82rem; font-weight: 500;
-    padding: 7px 16px; transition: all 0.15s; width: 100%;
+    background: #18181B !important;
+    color: #A1A1AA !important;
+    border: 0.5px solid #3F3F46 !important;
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+    padding: 6px 14px !important;
+    transition: all 0.12s !important;
+    width: 100% !important;
 }
-.stButton > button:hover  { background: #30363d; border-color: #8b949e; }
-.stButton > button:disabled { opacity: 0.25; cursor:not-allowed; }
-.btn-apply   > button { background:#1a4731 !important; border-color:#2ea043 !important; color:#3fb950 !important; }
-.btn-apply   > button:hover { background:#238636 !important; }
-.btn-destroy > button { background:#3d0f0f !important; border-color:#f85149 !important; color:#f85149 !important; }
-.btn-destroy > button:hover { background:#8b1a1a !important; }
-.btn-send    > button { background:#1565c0 !important; border-color:#1976d2 !important; color:#fff !important; height:62px; }
-.btn-send    > button:hover { background:#1976d2 !important; }
+.stButton > button:hover  { background: #27272A !important; color: #E4E4E7 !important; border-color: #52525B !important; }
+.stButton > button:active { transform: scale(0.99) !important; }
+.stButton > button:disabled { opacity: 0.3 !important; }
 
+.btn-apply   > button { background: #1E1B4B !important; border-color: #4338CA !important; color: #818CF8 !important; }
+.btn-apply   > button:hover { background: #312E81 !important; color: #C7D2FE !important; }
+.btn-destroy > button { background: #1A0505 !important; border-color: #991B1B !important; color: #FCA5A5 !important; }
+.btn-destroy > button:hover { background: #7F1D1D !important; }
+.btn-send    > button { background: #4F46E5 !important; border-color: #4338CA !important; color: #EEF2FF !important; height: 62px !important; font-size: 1rem !important; }
+.btn-send    > button:hover { background: #4338CA !important; }
+
+/* ── Textarea ── */
 .stTextArea textarea {
-    background: #161b22 !important; color: #e6edf3 !important;
-    border: 1px solid #30363d !important; border-radius: 10px !important;
-    font-size: 0.875rem !important; resize: none !important;
-    line-height: 1.5 !important;
+    background: #18181B !important;
+    color: #E4E4E7 !important;
+    border: 0.5px solid #3F3F46 !important;
+    border-radius: 10px !important;
+    font-size: 0.875rem !important;
+    resize: none !important;
+    line-height: 1.55 !important;
+    font-family: 'Inter', sans-serif !important;
 }
-.stTextArea textarea:focus { border-color:#1565c0 !important; box-shadow:0 0 0 3px rgba(21,101,192,0.12) !important; }
-.stTextArea textarea::placeholder { color:#484f58 !important; }
-
-[data-testid="metric-container"] {
-    background:#161b22; border:1px solid #30363d;
-    border-radius:8px; padding:10px 14px;
+.stTextArea textarea:focus {
+    border-color: #4F46E5 !important;
+    box-shadow: 0 0 0 2px rgba(79,70,229,0.2) !important;
 }
-[data-testid="metric-container"] label { color:#8b949e !important; font-size:0.7rem !important; text-transform:uppercase; letter-spacing:0.05em; }
-[data-testid="stMetricValue"] { color:#e6edf3 !important; font-size:1.6rem !important; font-weight:700 !important; }
+.stTextArea textarea::placeholder { color: #52525B !important; }
 
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+    background: #09090B !important;
+    gap: 2px !important;
+    padding: 0 !important;
+    border-bottom: 0.5px solid #27272A !important;
+}
+.stTabs [data-baseweb="tab"] {
+    background: transparent !important;
+    border: none !important;
+    color: #71717A !important;
+    font-size: 0.8rem !important;
+    font-weight: 500 !important;
+    padding: 8px 14px !important;
+    border-radius: 0 !important;
+    border-bottom: 2px solid transparent !important;
+}
+.stTabs [aria-selected="true"] {
+    background: transparent !important;
+    color: #E4E4E7 !important;
+    border-bottom: 2px solid #6366F1 !important;
+}
+.stTabs [data-baseweb="tab-panel"] {
+    background: #09090B !important;
+    padding: 10px 0 0 0 !important;
+}
+
+/* ── Expanders ── */
 .streamlit-expanderHeader {
-    background:#161b22 !important; border:1px solid #21262d !important;
-    border-radius:8px !important; color:#8b949e !important; font-size:0.78rem !important;
+    background: #18181B !important;
+    border: 0.5px solid #27272A !important;
+    border-radius: 8px !important;
+    color: #A1A1AA !important;
+    font-size: 0.78rem !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    padding: 8px 12px !important;
 }
-details[open] .streamlit-expanderHeader { border-radius:8px 8px 0 0 !important; }
-
-hr { border-color:#21262d !important; margin:0.6rem 0 !important; }
-.stSuccess { background:#0d2818 !important; border-left:3px solid #2ea043 !important; }
-.stWarning { background:#2d1f00 !important; border-left:3px solid #d29922 !important; }
-.stError   { background:#2d0f0f !important; border-left:3px solid #f85149 !important; }
-.stInfo    { background:#0c1e38 !important; border-left:3px solid #1565c0 !important; }
-
-/* ── Remove Streamlit default padding so layout fills viewport ── */
-section.main > div.block-container {
-    padding-top: 0 !important;
-    padding-bottom: 0 !important;
-    max-width: 100% !important;
+details[open] .streamlit-expanderHeader {
+    border-radius: 8px 8px 0 0 !important;
+    border-bottom: 0.5px solid #3F3F46 !important;
+}
+.streamlit-expanderContent {
+    background: #0F0F11 !important;
+    border: 0.5px solid #27272A !important;
+    border-top: none !important;
+    border-radius: 0 0 8px 8px !important;
 }
 
-/* ── Make main content fill remaining height after header bars ── */
-section.main { height: 100vh; overflow: hidden; }
+/* ── Metrics ── */
+[data-testid="metric-container"] {
+    background: #18181B !important;
+    border: 0.5px solid #27272A !important;
+    border-radius: 8px !important;
+    padding: 10px 14px !important;
+}
+[data-testid="metric-container"] label { color: #71717A !important; font-size: 0.68rem !important; text-transform: uppercase; letter-spacing: 0.06em; }
+[data-testid="stMetricValue"] { color: #F4F4F5 !important; font-size: 1.5rem !important; font-weight: 600 !important; }
 
-/* ── Input dock: always at bottom of chat column ── */
+/* ── Code blocks ── */
+.stCodeBlock { border-radius: 8px !important; font-size: 0.75rem !important; }
+code { background: #18181B !important; color: #818CF8 !important; padding: 1px 5px; border-radius: 4px; font-size: 0.82em; }
+
+/* ── Alerts ── */
+.stSuccess { background: #052E1A !important; border-left: 2px solid #16A34A !important; color: #86EFAC !important; }
+.stWarning { background: #1C1400 !important; border-left: 2px solid #D97706 !important; color: #FDE68A !important; }
+.stError   { background: #1A0505 !important; border-left: 2px solid #DC2626 !important; color: #FCA5A5 !important; }
+.stInfo    { background: #0C0A1E !important; border-left: 2px solid #4F46E5 !important; color: #C7D2FE !important; }
+
+hr { border-color: #27272A !important; margin: 0.5rem 0 !important; }
+
+/* ── Input dock ── */
 .input-dock {
     position: relative;
-    bottom: 0;
-    background: #0d1117;
-    padding: 8px 0 4px 0;
-    z-index: 200;
-    border-top: 1px solid #21262d;
+    background: #09090B;
+    padding: 8px 0 4px;
+    border-top: 0.5px solid #27272A;
 }
 
-/* ── Action buttons row ── */
+/* ── Action bar ── */
 .action-bar {
-    padding: 6px 0 2px 0;
-    background: #0d1117;
-    border-top: 1px solid #21262d;
-}
-
-/* ── Live log box in right panel ── */
-.log-box-live {
-    background: #0d1117;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 8px 14px;
-    font-family: "JetBrains Mono", monospace;
-    font-size: 0.70rem;
-    color: #8b949e;
-    height: 260px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-    scroll-behavior: smooth;
+    padding: 6px 0 2px;
+    background: #09090B;
+    border-top: 0.5px solid #27272A;
 }
 
 /* ── Log label ── */
 .log-label {
-    font-family: "JetBrains Mono", monospace;
-    font-size: 0.66rem;
-    color: #484f58;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    color: #52525B;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.07em;
     margin-bottom: 3px;
 }
 
-/* ── Auto-scroll live log to bottom ── */
-.log-box-live { overflow-anchor: none; }
-
-/* ── Column gap tight ── */
+section.main { height: 100vh; overflow: hidden; }
+section.main > div.block-container { padding-top: 0 !important; padding-bottom: 0 !important; max-width: 100% !important; }
 [data-testid="column"] > div { gap: 0 !important; }
 [data-testid="column"] { padding: 0 4px !important; }
 </style>
@@ -540,8 +605,17 @@ defaults = {
     "voice_model":     None,  # None = use VOICE_MODEL env default
     "voice_audio_bytes": None, # persisted bytes from st.audio_input across rerun
     # ── Monitor Agent ──────────────────────────────────────────────────────────
-    "monitor_alerts":  [],    # list of unread alert dicts from monitor agent
-    "monitor_hb":      None,  # last heartbeat from monitor agent
+    "monitor_alerts":  [],
+    "monitor_hb":      None,
+    # ── Deploy panel ───────────────────────────────────────────────────────────
+    "deploy_job_id":   None,
+    "deploy_repo_url": "",
+    "deploy_branch":   "main",
+    "deploy_app_name": "",
+    "deploy_env":      "production",
+    "deploy_prompt":   "",
+    "deploy_token":    "",
+    "deploy_history":  [],   # list of recent deploy records for history panel
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -594,95 +668,93 @@ if st.session_state.ready_to_apply and st.session_state.plan_ts:
 # ─────────────────────────────────────────────────────────────────────────────
 # TOP HEADER
 # ─────────────────────────────────────────────────────────────────────────────
-project_display = GCP_PROJECT_ID or "⚠️ GCP_PROJECT_ID not set"
+project_display = GCP_PROJECT_ID[:22] + "…" if len(GCP_PROJECT_ID) > 22 else GCP_PROJECT_ID or "⚠ set GCP_PROJECT_ID"
 _current_user = get_current_user()
 _current_role = get_current_role()
-_role_badge   = (
-    "<span style='background:#0d2818;border:1px solid #2ea043;color:#3fb950;"
-    "font-size:0.58rem;padding:1px 7px;border-radius:10px;margin-left:5px;font-weight:600'>ADMIN</span>"
-    if _current_role == "admin" else
-    "<span style='background:#1a1a2e;border:1px solid #30363d;color:#8b949e;"
-    "font-size:0.58rem;padding:1px 7px;border-radius:10px;margin-left:5px;font-weight:600'>VIEWER</span>"
+
+# State & lock info
+state_bucket = os.environ.get("TF_STATE_BUCKET", "")
+try:
+    lock_info = get_state_lock_info() if state_bucket else None
+except Exception:
+    lock_info = None
+
+_lock_pill = (
+    "<span style='background:#3D0000;border:0.5px solid #991B1B;color:#FCA5A5;"
+    "font-size:0.6rem;padding:1px 7px;border-radius:20px;font-weight:600'>🔐 LOCKED</span>"
+    if lock_info else
+    "<span style='background:#052E1A;border:0.5px solid #14532D;color:#4ADE80;"
+    "font-size:0.6rem;padding:1px 7px;border-radius:20px;font-weight:600'>● LIVE</span>"
 )
+_role_pill = (
+    "<span style='background:#1E1B4B;border:0.5px solid #3730A3;color:#818CF8;"
+    "font-size:0.6rem;padding:1px 7px;border-radius:20px;font-weight:600'>ADMIN</span>"
+    if _current_role == "admin" else
+    "<span style='background:#18181B;border:0.5px solid #3F3F46;color:#71717A;"
+    "font-size:0.6rem;padding:1px 7px;border-radius:20px;font-weight:600'>VIEWER</span>"
+)
+_region_short = GCP_DEFAULT_REGION
+
 st.markdown(f"""
-<div style='display:flex; align-items:center; padding:10px 20px;
-            border-bottom:1px solid #21262d; background:#0d1117;
-            position:sticky; top:0; z-index:999;'>
-    <span style='font-size:1.2rem; margin-right:10px'>☁️</span>
-    <span style='color:#e6edf3; font-weight:700; font-size:1rem; letter-spacing:-0.01em'>AI SRE Agent</span>
-    <span style='background:#0d2818; border:1px solid #2ea043; color:#3fb950;
-                 font-size:0.65rem; padding:1px 8px; border-radius:20px;
-                 margin-left:10px; font-weight:600'>● ONLINE</span>
-    <span style='margin-left:auto; color:#484f58; font-size:0.72rem;
-                 font-family:"JetBrains Mono"'>{GEMINI_MODEL} · GCP · Terraform</span>
-    <span style='margin-left:12px; color:#79c0ff; font-size:0.68rem;
-                 font-family:"JetBrains Mono"'>🏗️ {project_display}</span>
-    <span style='margin-left:16px; color:#8b949e; font-size:0.68rem;
-                 font-family:"JetBrains Mono"'>👤 {_current_user}</span>{_role_badge}
-    <a href="/logout" style='margin-left:12px; background:#1a1a2e; border:1px solid #30363d;
-                 color:#f85149; font-size:0.65rem; padding:3px 10px;
-                 border-radius:6px; text-decoration:none; font-family:"JetBrains Mono";
-                 font-weight:600; letter-spacing:0.03em;
-                 transition:border-color 0.2s'
-       onmouseover="this.style.borderColor='#f85149'"
-       onmouseout="this.style.borderColor='#30363d'">
-        ⏏ Sign Out
-    </a>
+<div style='display:flex;align-items:center;padding:0 20px;height:52px;
+            border-bottom:0.5px solid #27272A;background:#09090B;
+            position:sticky;top:0;z-index:999;gap:10px;'>
+  <div style='display:flex;align-items:center;gap:8px;min-width:0'>
+    <div style='width:28px;height:28px;background:#4F46E5;border-radius:8px;
+                display:flex;align-items:center;justify-content:center;
+                font-size:14px;flex-shrink:0'>⬡</div>
+    <span style='color:#F4F4F5;font-weight:600;font-size:0.9rem;white-space:nowrap'>AI SRE</span>
+  </div>
+  <div style='width:0.5px;height:20px;background:#27272A;flex-shrink:0'></div>
+  <div style='display:flex;align-items:center;gap:6px;min-width:0'>
+    <span style='color:#52525B;font-size:0.72rem;font-family:"JetBrains Mono";white-space:nowrap'>
+      {project_display}
+    </span>
+    <span style='color:#52525B;font-size:0.68rem'>/</span>
+    <span style='color:#71717A;font-size:0.7rem;font-family:"JetBrains Mono"'>{_region_short}</span>
+  </div>
+  {_lock_pill}
+  <div style='flex:1'></div>
+  <span style='color:#3F3F46;font-size:0.68rem;font-family:"JetBrains Mono";white-space:nowrap'>{GEMINI_MODEL}</span>
+  <div style='width:0.5px;height:20px;background:#27272A;flex-shrink:0'></div>
+  <div style='display:flex;align-items:center;gap:6px'>
+    <div style='width:22px;height:22px;background:#1E1B4B;border-radius:50%;
+                display:flex;align-items:center;justify-content:center;
+                font-size:10px;color:#818CF8;font-weight:600'>
+      {_current_user[0].upper() if _current_user and _current_user != "unknown" else "?"}
+    </div>
+    <span style='color:#71717A;font-size:0.75rem'>{_current_user}</span>
+    {_role_pill}
+  </div>
+  <a href="/logout" style='background:#18181B;border:0.5px solid #3F3F46;color:#71717A;
+     font-size:0.7rem;padding:4px 10px;border-radius:6px;text-decoration:none;
+     font-weight:500;white-space:nowrap;transition:all 0.12s'
+     onmouseover="this.style.borderColor='#F87171';this.style.color='#F87171'"
+     onmouseout="this.style.borderColor='#3F3F46';this.style.color='#71717A'">
+    Sign out
+  </a>
 </div>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Remote state banner
-# ─────────────────────────────────────────────────────────────────────────────
-state_bucket = os.environ.get("TF_STATE_BUCKET", "")
-if state_bucket:
-    # Check lock status (cached)
-    try:
-        lock_info = get_state_lock_info()
-    except Exception:
-        lock_info = None
-
-    if lock_info:
-        lock_html = (
-            f"<span style='background:#3d0000;border:1px solid #f85149;"
-            f"color:#f85149;padding:1px 8px;border-radius:4px;font-weight:700'>"
-            f"🔐 LOCKED by {lock_info['who']} · {lock_info['operation']}</span>"
-        )
-    else:
-        lock_html = "<span style='color:#3fb950'>🔓 Unlocked</span>"
-
+# State banner (only when lock or no bucket)
+if lock_info:
+    col_l1, col_l2 = st.columns([4, 1])
+    with col_l1:
+        st.error(
+            f"🔐 **State locked** — {lock_info['who']} · "
+            f"`{lock_info['operation']}` · ID: `{lock_info['id']}`")
+    with col_l2:
+        if st.button("Force unlock", use_container_width=True):
+            result = force_unlock_state(lock_info["id"])
+            st.success(result[:200])
+            st.rerun()
+elif not state_bucket:
     st.markdown(
-        f"<div style='background:#0d1a10;border-bottom:1px solid #2ea043;"
-        f"padding:5px 20px;font-size:0.72rem;font-family:JetBrains Mono,monospace;"
-        f"display:flex;align-items:center;gap:20px;'>"
-        f"<span style='color:#3fb950;font-weight:700'>☁️ GCS Remote State</span>"
-        f"<span style='color:#8b949e'>🪣 gs://{state_bucket}</span>"
-        f"<span style='color:#8b949e'>📍 {GCP_DEFAULT_REGION}</span>"
-        f"{lock_html}"
-        f"</div>",
-        unsafe_allow_html=True)
-
-    # Lock warning banner
-    if lock_info:
-        col_l1, col_l2 = st.columns([4, 1])
-        with col_l1:
-            st.error(
-                f"🔐 **State is locked** — {lock_info['who']} · "
-                f"op: `{lock_info['operation']}` · ID: `{lock_info['id']}`\n\n"
-                f"Apply/destroy operations are blocked until the lock is released.")
-        with col_l2:
-            if st.button("⚠️ Force Unlock", use_container_width=True):
-                result = force_unlock_state(lock_info["id"])
-                st.success(f"Unlock result: {result[:200]}")
-                st.rerun()
-else:
-    st.markdown(
-        "<div style='background:#2d1f00;border-bottom:1px solid #d29922;"
-        "padding:5px 20px;font-size:0.72rem;color:#d29922;"
+        "<div style='background:#1C1400;border-bottom:0.5px solid #78350F;"
+        "padding:5px 20px;font-size:0.72rem;color:#FCD34D;"
         "font-family:JetBrains Mono,monospace;'>"
-        "⚠️ Local state only — set <b>TF_STATE_BUCKET</b> to enable GCS remote state"
-        "</div>",
-        unsafe_allow_html=True)
+        "⚠ Local state only — set TF_STATE_BUCKET for GCS remote state"
+        "</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN LAYOUT
@@ -691,562 +763,651 @@ col_chat, col_right = st.columns([5, 2], gap="small")
 
 # =============================================================================
 # RIGHT PANEL
-# =============================================================================
 with col_right:
-    st.markdown("<div style='padding:0.5rem 1rem 0 0.5rem'>", unsafe_allow_html=True)
+    st.markdown("<div style='height:100%;overflow-y:auto;padding:8px 6px;background:#09090B'>", unsafe_allow_html=True)
 
-    # ── LIVE AGENT / APPLY LOGS (always visible at top of right panel) ─────────
+    # ── Live activity bar (always on top when active) ─────────────────────────
     active_jid = st.session_state.apply_job_id or st.session_state.agent_job_id
     right_logs = []
     if active_jid:
         right_logs = get_job(active_jid).get("logs", [])
 
-    is_agent_running  = bool(st.session_state.agent_job_id and st.session_state.thinking)
+    is_agent_running = bool(st.session_state.agent_job_id and st.session_state.thinking)
     _aj = st.session_state.apply_job_id
-    is_apply_running  = bool(_aj and get_job(_aj).get("status") == "running")
+    is_apply_running = bool(_aj and get_job(_aj).get("status") == "running")
 
-    log_label_text = (
-        "🔄 Agent — thinking..." if is_agent_running else
-        "⚙️ Apply — running..."  if is_apply_running else
-        "📋 Last run logs"       if right_logs else
-        "📋 Agent Logs"
-    )
-    label_col = "#3fb950" if is_agent_running else "#d29922" if is_apply_running else "#484f58"
+    if right_logs or is_agent_running or is_apply_running:
+        log_label_text = (
+            "Agent  thinking…" if is_agent_running else
+            "Apply  running…"  if is_apply_running else
+            "Agent logs")
+        _dot_color = "#818CF8" if is_agent_running else "#4ADE80" if is_apply_running else "#52525B"
+        st.markdown(
+            f"<div style='font-family:JetBrains Mono;font-size:0.62rem;color:{_dot_color};"
+            f"text-transform:uppercase;letter-spacing:0.07em;margin-bottom:3px'>"
+            f"● {log_label_text}</div>",
+            unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="log-box">{colorize_logs(right_logs)}</div>',
+            unsafe_allow_html=True)
+        if is_agent_running or is_apply_running:
+            time.sleep(0.8); st.rerun()
+        st.markdown("<div style='margin:6px 0'></div>", unsafe_allow_html=True)
 
-    st.markdown(
-        f"<div class='log-label' style='color:{label_col}'>{log_label_text}</div>",
-        unsafe_allow_html=True)
+    # ── 4-tab context panel ───────────────────────────────────────────────────
+    _tab_files, _tab_monitor, _tab_history, _tab_drift, _tab_deploy = st.tabs(
+        ["Files", "Monitor", "History", "Drift", "Deploy"])
 
-    log_html = colorize_logs(right_logs) if right_logs else (
-        "<span style='color:#21262d'>No logs yet — start a conversation</span>")
-    st.markdown(
-        f"<div class='log-box-live' id='live-log'>{log_html}</div>"
-        "<script>var b=document.getElementById('live-log');"
-        "if(b)b.scrollTop=b.scrollHeight;</script>",
-        unsafe_allow_html=True)
-
-    st.markdown("<div style='margin-top:10px'>", unsafe_allow_html=True)
-    try:
-        all_code = TerraformTools.read_code()
-        all_res  = re.findall(r'resource\s+"([^"]+)"\s+"([^"]+)"', all_code)
-    except Exception:
-        all_code, all_res = "", []
-
-    st.markdown("---")
-
-    # Apply button removed from right panel — lives in chat bubbles only
-
-    # Apply job status
-    if st.session_state.apply_job_id:
-        job    = get_job(st.session_state.apply_job_id)
-        status = job.get("status", "running")
-        result = job.get("result") or {}
-        logs   = job.get("logs", [])
-        if status == "running":
-            st.info("⏳ Applying changes in GCP...")
-            if logs:
-                st.markdown(f'<div class="log-box">{colorize_logs(logs)}</div>', unsafe_allow_html=True)
-            time.sleep(3); st.rerun()
-        elif status in ("done", "error"):
-            out     = result.get("output", result.get("message", ""))
-            out_low = out.lower()
-            is_destroyed = "destroy complete" in out_low
-            is_applied   = "apply complete"   in out_low
-            # Primary success signal: job status + terraform completion keyword
-            is_real_success = (result.get("status") == "success") and (is_destroyed or is_applied)
-            # Detect backend config errors (need restart)
-            needs_reinit = any(x in out_low for x in ["reconfigure", "migrate-state"])                            and not (is_destroyed or is_applied)
-            # Detect credential errors specifically for a better hint
-            needs_auth   = any(x in out_low for x in
-                               ["application default credentials", "could not find default credentials",
-                                "permission denied", "403"])                            and not (is_destroyed or is_applied)
-
-            if is_real_success:
-                label = "💣 Destroyed!" if is_destroyed else "✅ Applied successfully!"
-                st.success(label)
-                lines = [l for l in out.splitlines() if any(
-                    x in l for x in ["Apply complete", "Destroy complete", "Resources:"])]
-                summary = "\n".join(lines[:3]) if lines else out[-300:]
-                chat_content = ("💣 **Destroyed!**" if is_destroyed else "✅ **Applied!**")
-                chat_content += "\n```\n" + summary.strip() + "\n```"
-                st.session_state.messages.append({
-                    "role": "assistant", "type": "success", "content": chat_content
-                })
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 1 — FILES (main.tf, provider.tf, tfstate, plan)
+    # ═══════════════════════════════════════════════════════════════════════
+    with _tab_files:
+        # ── main.tf ──────────────────────────────────────────────────────
+        with st.expander("main.tf", expanded=False):
+            hcl = TerraformTools.read_code()
+            if hcl.strip():
+                st.code(hcl, language="hcl")
             else:
-                # Split full output from the error tail (last 50 lines)
-                TAIL_MARKER = "\n~~~ERROR_TAIL~~~\n"
-                if TAIL_MARKER in out:
-                    full_out, error_tail = out.split(TAIL_MARKER, 1)
-                else:
-                    full_out  = out
-                    # Fallback: last 40 lines is the error zone
-                    lines_all = out.strip().splitlines()
-                    error_tail = "\n".join(lines_all[-40:]) if len(lines_all) > 40 else out
+                st.caption("Empty — no resources yet.")
 
-                # Classify error type from the tail (where real errors live)
-                tail_low = error_tail.lower()
-                # Check if this is one of our rich diagnostic messages (starts with emoji + keyword)
-                is_diagnostic = any(out.lstrip().startswith(p) for p in
-                                    ["🔐", "🪣", "🔑", "❌ Init failed"])
-
-                if needs_reinit:
-                    err_label = "⚠️ Backend not initialised"
-                    hint = "💡 Run: `docker compose restart`"
-                elif "403" in tail_low or "access denied" in tail_low or is_diagnostic:
-                    err_label = "🔐 GCS Permission Error"
-                    hint = ""
-                elif needs_auth or any(x in tail_low for x in
-                                       ["application default credentials",
-                                        "could not find default credentials",
-                                        "credentials", "authentication"]):
-                    err_label = "🔐 GCP authentication failed"
-                    hint = "💡 Check **GOOGLE_CREDENTIALS** or **GOOGLE_APPLICATION_CREDENTIALS** in your `.env` file"
-                elif result.get("status") == "error":
-                    err_label = "❌ Apply failed"
-                    hint = ""
-                else:
-                    err_label = "❌ Apply did not complete"
-                    hint = ""
-
-                st.error(err_label)
-                if hint:
-                    st.info(hint)
-
-                # Show the error tail prominently — this is where the real error is
-                st.markdown("""
-                <div style='background:#1a0a0a; border:1px solid #f85149; border-radius:8px;
-                             padding:4px 0; margin:6px 0;'>
-                    <div style='padding:6px 14px; font-size:0.72rem; color:#f85149;
-                                font-family:"JetBrains Mono"; border-bottom:1px solid #2d0f0f;'>
-                        ⬇️  Error detail (last 40 lines)
-                    </div>
-                </div>""", unsafe_allow_html=True)
-                st.code(error_tail.strip(), language="bash")
-
-                with st.expander("📄 Full output", expanded=False):
-                    st.code(full_out.strip(), language="bash")
-
-                st.session_state.messages.append({
-                    "role": "assistant", "type": "error",
-                    "content": "❌ **" + err_label + "**\n```\n" + error_tail.strip()[-800:] + "\n```"
-                })
-            st.session_state.apply_job_id = None
-            st.rerun()
-
-    st.markdown("---")
-
-    # ── Terraform files ───────────────────────────────────────────────────────
-    with st.expander("📁 main.tf", expanded=False):
-        st.code(all_code if all_code else "# empty", language="hcl")
-
-    with st.expander("☁️ Remote State (GCS)", expanded=False):
-        try:
-            bucket_env = os.environ.get("TF_STATE_BUCKET", "")
-            bpath = f"{TF_DIR}/backend.tf"
-
-            if bucket_env:
-                state_data  = read_tfstate()
-                n_resources = len(state_data["resources"])
-                serial      = state_data["raw"].get("serial", "—")
-                tf_ver      = state_data["raw"].get("terraform_version", "—")
-
-                st.markdown(
-                    f"<div style='display:flex;flex-wrap:wrap;gap:14px;"
-                    f"font-family:JetBrains Mono,monospace;font-size:0.72rem;"
-                    f"color:#8b949e;padding:4px 0'>"
-                    f"<span>🪣 <b style='color:#e6edf3'>gs://{bucket_env}</b></span>"
-                    f"<span>📦 {n_resources} resources</span>"
-                    f"<span>🔢 serial {serial}</span>"
-                    f"<span>🏗️ tf {tf_ver}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True)
-
-                bcol1, bcol2 = st.columns(2)
-                with bcol1:
-                    if st.button("⬆️ Push State → GCS", use_container_width=True,
-                                 help="Upload local terraform.tfstate to the GCS remote backend"):
-                        st.session_state.state_push_job = start_state_push_job()
-                        st.rerun()
-                with bcol2:
-                    gcs_url = f"https://console.cloud.google.com/storage/browser/{bucket_env}"
-                    st.markdown(
-                        f"<a href='{gcs_url}' target='_blank' style='"
-                        "display:block;text-align:center;padding:6px 0;background:#161b22;"
-                        "border:1px solid #30363d;border-radius:6px;color:#79c0ff;"
-                        "font-size:0.78rem;text-decoration:none'>🔗 GCS Console</a>",
-                        unsafe_allow_html=True)
-
-                # Push job status
-                push_jid = st.session_state.get("state_push_job")
-                if push_jid:
-                    pjob = get_job(push_jid)
-                    pstatus = pjob.get("status")
-                    presult = (pjob.get("result") or {})
-                    if pstatus == "running":
-                        st.info("⏳ Pushing state to GCS…")
-                        time.sleep(1); st.rerun()
-                    elif pstatus == "done":
-                        st.success(presult.get("message", "State pushed."))
-                        st.session_state.state_push_job = None
-                    elif pstatus == "error":
-                        st.error(presult.get("message", "Push failed."))
-                        st.session_state.state_push_job = None
-
-                if os.path.exists(bpath):
-                    with st.expander("📄 backend.tf", expanded=False):
-                        st.code(open(bpath).read(), language="hcl")
-            else:
-                st.warning("TF_STATE_BUCKET not set — using local state.")
-                if os.path.exists(bpath):
-                    st.code(open(bpath).read(), language="hcl")
-        except Exception as e:
-            st.caption(f"State panel error: {e}")
-
-    with st.expander("🔌 provider.tf", expanded=False):
-        try:
-            ptf_path    = f"{TF_DIR}/provider.tf"
-            ptf_content = open(ptf_path).read() if os.path.exists(ptf_path) else "# not created yet"
-            st.code(ptf_content, language="hcl")
-            aliases = get_existing_provider_aliases()
-            if aliases:
-                alias_html = "".join(
-                    f'<div class="res-card" style="margin:3px 0">'
-                    f'<span style="color:#79c0ff;font-family:JetBrains Mono;font-size:0.75rem">{a}</span>'
-                    f'<span class="res-type">{r}</span></div>'
-                    for a, r in aliases.items()
-                )
-                st.markdown(f"**Active aliases:**{alias_html}", unsafe_allow_html=True)
-        except Exception as e:
-            st.caption(f"Error: {e}")
-
-    with st.expander("🗃️ tfstate", expanded=False):
-        sp = f"{TF_DIR}/terraform.tfstate"
-        if os.path.exists(sp):
+        # ── provider.tf ──────────────────────────────────────────────────
+        with st.expander("provider.tf", expanded=False):
             try:
-                s = json.load(open(sp))
-                for r in s.get("resources", []):
+                ptf = open(f"{TF_DIR}/provider.tf").read()
+                st.code(ptf, language="hcl")
+            except Exception:
+                st.caption("Not generated yet.")
+
+        # ── Remote state ──────────────────────────────────────────────────
+        if state_bucket:
+            with st.expander(f"Remote state  gs://{state_bucket[:20]}", expanded=False):
+                tf_state = read_tfstate()
+                if tf_state:
+                    resources = tf_state.get("resources", [])
                     st.markdown(
-                        f'<div class="res-card running">'
-                        f'<span>{resource_icon(r.get("type",""))}</span>'
-                        f'<span class="res-name">{r.get("name")}</span>'
-                        f'<span class="res-type">{r.get("type")}</span></div>',
+                        f"<div style='font-size:0.68rem;color:#71717A;font-family:JetBrains Mono;"
+                        f"margin-bottom:6px'>{len(resources)} resource(s) · "
+                        f"serial {tf_state.get('serial',0)} · "
+                        f"tf {tf_state.get('terraform_version','')}</div>",
                         unsafe_allow_html=True)
-                st.caption(f"terraform v{s.get('terraform_version')} · serial {s.get('serial')}")
-            except Exception as e:
-                st.caption(f"Error: {e}")
-        else:
-            st.caption("No state file yet.")
+                    for r in resources:
+                        inst   = (r.get("instances") or [{}])[0]
+                        attrs  = inst.get("attributes", {})
+                        rname  = attrs.get("name") or r.get("name", "")
+                        st.markdown(
+                            f"<div class='res-card'>"
+                            f"<span>{resource_icon(r.get('type',''))}</span>"
+                            f"<span class='res-name'>{rname}</span>"
+                            f"<span class='res-type'>{r.get('type','').replace('google_','')}</span>"
+                            f"</div>", unsafe_allow_html=True)
+                else:
+                    st.caption("No state file yet.")
 
-    if st.session_state.agent_job_id or st.session_state.ready_to_apply:
-        job_id = st.session_state.agent_job_id
-        if job_id:
-            res      = (get_job(job_id).get("result") or {})
-            plan_txt = res.get("plan", "")
-            if plan_txt:
-                with st.expander("🔍 Terraform Plan", expanded=True):
-                    for line in plan_txt.splitlines():
-                        if any(x in line for x in ["to add", "to change", "to destroy"]):
-                            has_dest = "to destroy" in line and "0 to destroy" not in line
-                            color    = "#f85149" if has_dest else "#3fb950"
-                            st.markdown(
-                                f'<p style="color:{color}; font-family:JetBrains Mono; '
-                                f'font-size:0.85rem; font-weight:600; margin:4px 0">'
-                                f'▸ {line.strip()}</p>', unsafe_allow_html=True)
-                            break
-                    st.code(plan_txt, language="bash")
+        # ── Terraform plan (when ready) ───────────────────────────────────
+        if st.session_state.agent_job_id or st.session_state.ready_to_apply:
+            job_id = st.session_state.agent_job_id
+            if job_id:
+                res      = (get_job(job_id).get("result") or {})
+                plan_txt = res.get("plan", "")
+                if plan_txt:
+                    with st.expander("Terraform plan", expanded=True):
+                        for line in plan_txt.splitlines():
+                            if any(x in line for x in ["to add", "to change", "to destroy"]):
+                                has_dest = "to destroy" in line and "0 to destroy" not in line
+                                color    = "#F87171" if has_dest else "#4ADE80"
+                                plan_line = line.strip()
+                                st.markdown(
+                                    f'<p style="color:{color};font-family:JetBrains Mono;'
+                                    f'font-size:0.82rem;font-weight:600;margin:4px 0">'
+                                    f'▸ {plan_line}</p>', unsafe_allow_html=True)
+                                break
+                        st.code(plan_txt, language="bash")
 
-    # ── Audit Trail ───────────────────────────────────────────────────────────
-    with st.expander("📋 Audit Trail", expanded=False):
-        audit_entries = read_audit_log(max_entries=50)
-        if not audit_entries:
-            st.caption("No actions logged yet.")
-        else:
-            _ACTION_COLOR = {
-                "apply": "#3fb950", "plan": "#4d9eff", "destroy": "#f85149",
-                "apply_target": "#79c0ff", "error": "#ff4d6d", "unknown": "#484f58",
-            }
-            for entry in audit_entries:
-                action   = entry.get("type", entry.get("action", "unknown"))
-                status   = entry.get("action", "done")
-                user     = entry.get("user", "—")
-                ts       = (entry.get("ts") or "")[:19].replace("T", " ")
-                color    = _ACTION_COLOR.get(action, "#8b949e")
-                err_col  = "#f85149" if status == "error" else color
-                added    = entry.get("resources_added", [])
-                destroyed= entry.get("resources_destroyed", [])
-                fixed    = entry.get("auto_fixed", [])
-                cost     = entry.get("cost_total")
-                findings = entry.get("security_findings", 0)
-                details  = []
-                if added:     details.append(f"+{len(added)}")
-                if destroyed: details.append(f"💣{len(destroyed)}")
-                if fixed:     details.append(f"🔒{len(fixed)}")
-                if cost:      details.append(f"${cost:.0f}/mo")
-                if findings:  details.append(f"⚠️{findings}")
-                detail_str = " · ".join(details) or (entry.get("message","")[:120])
-                st.markdown(
-                    f"<div style='font-family:JetBrains Mono,monospace;font-size:0.67rem;"
-                    f"padding:5px 8px;margin-bottom:3px;border-left:3px solid {err_col};"
-                    f"background:#0d1117;border-radius:0 4px 4px 0'>"
-                    f"<span style='color:{err_col};font-weight:700'>{action.upper()}</span>"
-                    f" <span style='color:#484f58'>{user} · {ts}</span>"
-                    f"{'<br><span style=color:#8b949e>' + detail_str + '</span>' if detail_str else ''}"
-                    f"</div>", unsafe_allow_html=True)
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 2 — MONITOR
+    # ═══════════════════════════════════════════════════════════════════════
+    with _tab_monitor:
+        _poll_monitor_alerts()
+        _hb   = st.session_state.monitor_hb
+        _mals = st.session_state.monitor_alerts
 
-    # ── Monitor Agent Alerts ───────────────────────────────────────────────────
-    _poll_monitor_alerts()   # pull new alerts from Redis (non-blocking)
-    _hb   = st.session_state.monitor_hb
-    _mals = st.session_state.monitor_alerts
-
-    _hb_dot   = "🟢" if _hb and _hb.get("healthy") else ("🔴" if _hb else "⚪")
-    _mal_badge = f" ({len(_mals)})" if _mals else ""
-    with st.expander(f"{_hb_dot} Monitor Agent{_mal_badge}", expanded=bool(_mals)):
         if _hb:
+            _err_rate = _hb.get("err_rate", 0)
+            _healthy  = _hb.get("healthy", True)
+            _hb_color = "#4ADE80" if _healthy else "#F87171"
             st.markdown(
-                f"<div style='font-family:JetBrains Mono;font-size:0.6rem;color:#484f58;"
-                f"margin-bottom:6px'>"
-                f"🖥️ {_hb.get('vm_count',0)} VMs &nbsp;·&nbsp; "
-                f"🪣 {_hb.get('bkt_count',0)} buckets &nbsp;·&nbsp; "
-                f"⚠️ {_hb.get('err_rate',0):.1f} err/min &nbsp;·&nbsp; "
-                f"last poll {(_hb.get('ts',''))[11:19]} UTC</div>",
-                unsafe_allow_html=True)
+                f"<div style='display:flex;gap:12px;margin-bottom:8px;padding:8px 10px;"
+                f"background:#18181B;border-radius:8px;border:0.5px solid #27272A'>"
+                f"<div style='text-align:center'>"
+                f"<div style='font-size:1.1rem;font-weight:600;color:#F4F4F5'>{_hb.get('vm_count',0)}</div>"
+                f"<div style='font-size:0.62rem;color:#52525B;font-family:JetBrains Mono'>VMs</div></div>"
+                f"<div style='text-align:center'>"
+                f"<div style='font-size:1.1rem;font-weight:600;color:#F4F4F5'>{_hb.get('bkt_count',0)}</div>"
+                f"<div style='font-size:0.62rem;color:#52525B;font-family:JetBrains Mono'>Buckets</div></div>"
+                f"<div style='text-align:center'>"
+                f"<div style='font-size:1.1rem;font-weight:600;color:{_hb_color}'>{_err_rate:.1f}</div>"
+                f"<div style='font-size:0.62rem;color:#52525B;font-family:JetBrains Mono'>err/min</div></div>"
+                f"</div>", unsafe_allow_html=True)
         else:
-            st.caption("Monitor agent not connected — check docker-compose.")
+            st.markdown(
+                "<div style='font-size:0.75rem;color:#52525B;padding:6px 0;font-family:JetBrains Mono'>"
+                "Monitor agent not connected</div>", unsafe_allow_html=True)
 
         if _mals:
-            sev_col = {"critical": "#f85149", "high": "#f0883e",
-                       "medium":   "#e3b341", "low":  "#4d9eff"}
-            sev_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
-            for i, al in enumerate(_mals[-10:]):
-                sev   = al.get("severity", "medium")
-                color = sev_col.get(sev, "#4d9eff")
-                icon  = sev_icon.get(sev, "⚪")
-                ts    = al.get("ts", "")
-                ts_s  = ts[11:19] if len(ts) > 18 else ts
-                action_html = ""
-                if al.get("suggested_action"):
-                    action_html = (
-                        "<div style='font-size:0.65rem;color:#3fb950;margin-top:3px'>💡 "
-                        + al.get("suggested_action", "")
-                        + "</div>"
-                    )
+            _sev_color = {"critical":"#F87171","high":"#FCD34D","medium":"#818CF8","low":"#71717A"}
+            for al in _mals[-8:]:
+                sev   = al.get("severity","medium")
+                color = _sev_color.get(sev,"#71717A")
+                ts    = (al.get("ts","") or "")[11:16]
+                _fix  = al.get("suggested_action","")
+                _fix_html = (
+                    f"<div style='font-size:0.62rem;color:#4ADE80;margin-top:2px'>→ {_fix[:60]}</div>"
+                    if _fix else ""
+                )
                 st.markdown(
-                    f"<div style='background:#0d1117;border-left:3px solid {color};"
-                    f"border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:5px'>"
-                    f"<div style='font-family:JetBrains Mono;font-size:0.65rem;"
-                    f"color:{color};font-weight:600'>{icon} {al.get('title','')}"
-                    f"<span style='float:right;color:#484f58;font-weight:400'>{ts_s}</span></div>"
-                    f"<div style='font-size:0.72rem;color:#8b949e;margin-top:2px'>"
-                    f"{al.get('body','')}</div>"
-                    f"{action_html}"
-                    f"</div>",
-                    unsafe_allow_html=True)
+                    f"<div style='border-left:2px solid {color};padding:6px 10px 6px 8px;"
+                    f"background:#18181B;border-radius:0 6px 6px 0;margin-bottom:5px'>"
+                    f"<div style='font-size:0.72rem;font-weight:500;color:{color}'>"
+                    f"{al.get('title','')} "
+                    f"<span style='float:right;color:#3F3F46;font-weight:400;font-family:JetBrains Mono'>{ts}</span></div>"
+                    f"<div style='font-size:0.68rem;color:#71717A;margin-top:2px'>{al.get('body','')[:90]}</div>"
+                    f"{_fix_html}"
+                    f"</div>", unsafe_allow_html=True)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("🗑️ Clear alerts", key="clear_mon_alerts",
-                             use_container_width=True):
-                    st.session_state.monitor_alerts = []
-                    st.rerun()
-            with c2:
-                if st.button("▶ Run now", key="mon_run_now",
-                             use_container_width=True):
-                    _trigger_monitor_run()
-                    st.rerun()
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                if st.button("Clear", key="mon_clear", use_container_width=True):
+                    st.session_state.monitor_alerts = []; st.rerun()
+            with mc2:
+                if st.button("Run now", key="mon_run", use_container_width=True):
+                    _trigger_monitor_run(); st.rerun()
         else:
-            st.caption("No active alerts — infrastructure looks healthy.")
-            if st.button("▶ Run check now", key="mon_run_now2",
-                         use_container_width=True):
-                _trigger_monitor_run()
-                st.rerun()
+            st.caption("No active alerts — infrastructure healthy.")
+            if st.button("Run check now", key="mon_run2", use_container_width=True):
+                _trigger_monitor_run(); st.rerun()
 
-    # ── Version History & Rollback ─────────────────────────────────────────────
-    with st.expander("⏪ Version History", expanded=False):
-        versions = get_version_history()
-        if not versions:
-            st.caption("No versions saved yet — versions are created after each successful apply.")
-        else:
-            # Show rollback job status if running
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 3 — HISTORY (audit + versions)
+    # ═══════════════════════════════════════════════════════════════════════
+    with _tab_history:
+        # ── Audit trail ───────────────────────────────────────────────────
+        with st.expander("Audit trail", expanded=False):
+            audit_entries = read_audit_log(max_entries=40)
+            if audit_entries:
+                _sev_col = {"error":"#F87171","apply":"#4ADE80","plan":"#818CF8","destroy":"#FCD34D"}
+                for entry in audit_entries[:15]:
+                    action = entry.get("action","")
+                    user   = entry.get("user","")
+                    ts     = (entry.get("ts","") or entry.get("ended",""))[:16].replace("T"," ")
+                    err_col = "#F87171" if action == "error" else "#4ADE80" if action == "apply" else "#3F3F46"
+                    added     = entry.get("added",[])
+                    destroyed = entry.get("destroyed",[])
+                    cost      = (entry.get("cost_estimate") or {}).get("total_monthly",0)
+                    details   = []
+                    if added:     details.append(f"+{len(added)}")
+                    if destroyed: details.append(f"−{len(destroyed)}")
+                    if cost:      details.append(f"${cost:.0f}/mo")
+                    detail_str = " · ".join(details) or (entry.get("message","")[:60])
+                    _dh = ("<div style='font-size:0.65rem;color:#71717A;margin-top:1px'>" + detail_str + "</div>") if detail_str else ""
+                    st.markdown(
+                        f"<div style='border-left:2px solid {err_col};padding:5px 8px;"
+                        f"background:#18181B;border-radius:0 6px 6px 0;margin-bottom:4px'>"
+                        f"<div style='font-family:JetBrains Mono;font-size:0.65rem'>"
+                        f"<span style='color:{err_col};font-weight:600'>{action.upper()}</span>"
+                        f" <span style='color:#52525B'>{user} · {ts}</span></div>"
+                        f"{_dh}"
+                        f"</div>", unsafe_allow_html=True)
+            else:
+
+                st.caption("No audit entries yet.")
+
+        # ── Version history ───────────────────────────────────────────────
+        with st.expander("Version history", expanded=False):
             if st.session_state.rollback_job_id:
                 _rj = get_job(st.session_state.rollback_job_id)
                 if _rj.get("status") == "running":
-                    st.info("⏳ Preparing rollback plan…")
+                    st.info("⏳ Preparing rollback…")
                 elif (_rj.get("result") or {}).get("status") == "error":
-                    st.error((_rj.get("result") or {}).get("message", "Rollback failed"))
+                    st.error((_rj.get("result") or {}).get("message","Rollback failed."))
                     st.session_state.rollback_job_id = None
+                elif _rj.get("status") == "done":
+                    st.session_state.rollback_job_id = None; st.rerun()
 
-            _ACTION_ICON = {
-                "apply": "🟢", "destroy": "🔴",
-                "apply_target": "🟡", "rollback": "⏪", "system": "⚙️",
-            }
-            for v in versions:
-                vid   = v["version_id"]
-                ts_v  = v.get("ts","")[:19].replace("T"," ")
-                label = v.get("label", "—")
-                user  = v.get("user", "—")
-                nres  = v.get("resource_count", 0)
-                icon  = _ACTION_ICON.get(v.get("action",""), "📌")
-                serial= v.get("state_serial")
-                is_current = (vid == versions[0]["version_id"])  # newest = current
+            versions = get_version_history()
+            if not versions:
+                st.caption("No versions yet — applied runs are saved here.")
+            else:
+                for v in versions[:8]:
+                    v_id  = v.get("version_id","")[:12]
+                    v_ts  = v.get("ts","")[:16].replace("T"," ")
+                    v_res = v.get("resource_count", 0)
+                    v_act = v.get("action","apply")
+                    v_col = "#F87171" if v_act == "destroy" else "#4ADE80"
+                    st.markdown(
+                        f"<div style='background:#18181B;border:0.5px solid #27272A;"
+                        f"border-radius:8px;padding:8px 10px;margin-bottom:5px'>"
+                        f"<div style='font-family:JetBrains Mono;font-size:0.68rem;"
+                        f"color:#71717A;display:flex;justify-content:space-between'>"
+                        f"<span style='color:#A1A1AA'>{v_ts}</span>"
+                        f"<span style='color:{v_col}'>{v_act}</span></div>"
+                        f"<div style='font-size:0.7rem;color:#F4F4F5;margin-top:3px'>"
+                        f"{v_res} resource(s) · <span style='font-family:JetBrains Mono;color:#52525B'>{v_id}</span>"
+                        f"</div></div>", unsafe_allow_html=True)
+                    if not (st.session_state.ready_to_apply or st.session_state.rollback_job_id):
+                        if st.button(f"Roll back to this", key=f"rb_{v.get('version_id','')}",
+                                     use_container_width=True):
+                            st.session_state.rollback_job_id = start_rollback_job(
+                                v, user=get_current_user())
+                            st.rerun()
 
-                current_badge = (
-                    "&nbsp;&nbsp;<span style='background:#1f3a5f;color:#4d9eff;"
-                    "font-size:0.55rem;padding:1px 5px;border-radius:3px'>CURRENT</span>"
-                    if is_current else ""
-                )
-                border_col  = "#4d9eff" if is_current else "#21262d"
-                res_plural  = "s" if nres != 1 else ""
-                serial_str  = f" · serial {serial}" if serial else ""
-                st.markdown(
-                    f"<div style='background:#0d1117;border:1px solid #21262d;"
-                    f"border-left:3px solid {border_col};"
-                    f"border-radius:0 6px 6px 0;padding:8px 10px;margin-bottom:6px'>"
-                    f"<div style='display:flex;justify-content:space-between;align-items:center'>"
-                    f"<span style='font-family:JetBrains Mono;font-size:0.65rem;color:#8b949e'>"
-                    f"{icon} {ts_v}{current_badge}"
-                    f"</span>"
-                    f"<span style='font-family:JetBrains Mono;font-size:0.6rem;color:#484f58'>"
-                    f"{nres} resource{res_plural}{serial_str}"
-                    f"</span></div>"
-                    f"<div style='font-size:0.72rem;color:#c9d1d9;margin-top:3px'>{label}</div>"
-                    f"<div style='font-size:0.62rem;color:#484f58'>by {user} · id {vid}</div>"
-                    f"</div>", unsafe_allow_html=True)
-
-                # Resources tooltip
-                res_list = v.get("resources", [])
-                if res_list:
-                    with st.expander(f"  📋 {nres} resource(s) in this version", expanded=False):
-                        for r in res_list:
-                            st.markdown(
-                                f"<span style='font-family:JetBrains Mono;font-size:0.65rem;"
-                                f"color:#8b949e'>{r.get('type','?')}."
-                                f"<b style='color:#c9d1d9'>{r.get('name','?')}</b></span>",
-                                unsafe_allow_html=True)
-
-                if not is_current and not st.session_state.ready_to_apply:
-                    if st.button(f"⏪ Roll back to this version",
-                                 key=f"rb_{vid}", use_container_width=True):
-                        user_now = get_current_user()
-                        st.session_state.rollback_job_id = start_rollback_job(vid, user=user_now)
-                        st.session_state.thinking = True
-                        st.session_state.messages.append({
-                            "role": "user",
-                            "content": f"⏪ Rolling back to version `{vid}` ({label})"
-                        })
-                        st.rerun()
-                elif is_current:
-                    st.caption("  ↳ This is the current version")
-                st.markdown("---" if not is_current else "", unsafe_allow_html=True)
-
-    # ── Drift Detection ───────────────────────────────────────────────────────
-    with st.expander("🔀 Drift Detection", expanded=False):
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 4 — DRIFT
+    # ═══════════════════════════════════════════════════════════════════════
+    with _tab_drift:
         st.markdown(
-            "<div style='font-family:JetBrains Mono;font-size:0.65rem;color:#484f58;"
-            "line-height:1.7;margin-bottom:8px'>"
-            "Detect resources manually deleted or modified in GCP console."
-            "</div>", unsafe_allow_html=True)
+            "<div style='font-size:0.72rem;color:#52525B;margin-bottom:10px'>"
+            "Detect resources modified or deleted outside Terraform.</div>",
+            unsafe_allow_html=True)
 
-        # Poll drift fix job
-        _dfix_jid = st.session_state.drift_fix_job_id
-        if _dfix_jid:
-            _dj = get_job(_dfix_jid)
-            if _dj.get("status") == "running":
+        if st.session_state.drift_fix_job_id:
+            _dfj = get_job(st.session_state.drift_fix_job_id)
+            if _dfj.get("status") == "running":
                 st.info("⏳ Fixing drift…")
-            elif _dj.get("status") in ("done", "error"):
-                msg = (_dj.get("result") or {}).get("message", "")
-                if _dj.get("status") == "done":
-                    st.success(msg)
+                time.sleep(1.5); st.rerun()
+            elif _dfj.get("status") in ("done","error"):
+                r = (_dfj.get("result") or {})
+                if r.get("status") == "error":
+                    st.error(r.get("message","Fix failed."))
                 else:
-                    st.error(msg)
+                    st.success(r.get("message","Drift fixed."))
                 st.session_state.drift_fix_job_id = None
                 st.session_state.drift_result     = None
 
-        # Poll drift detection job
         _drift_jid = st.session_state.drift_job_id
         if _drift_jid:
-            _dj = get_job(_drift_jid)
-            if _dj.get("status") == "running":
+            _dj  = get_job(_drift_jid)
+            _dst = _dj.get("status","running")
+            if _dst == "running":
                 st.info("⏳ Scanning for drift…")
-                import time as _t; _t.sleep(1); st.rerun()
-            elif _dj.get("status") == "done":
+                time.sleep(1.5); st.rerun()
+            elif _dst in ("done","error"):
                 st.session_state.drift_result  = (_dj.get("result") or {}).get("drift")
                 st.session_state.drift_job_id  = None
-                st.rerun()
-            elif _dj.get("status") == "error":
-                st.error((_dj.get("result") or {}).get("message","Drift scan failed."))
+            else:
                 st.session_state.drift_job_id = None
 
         _drift = st.session_state.drift_result
-
-        # Show scan button when no result yet
-        if not _drift and not _drift_jid:
-            if st.button("🔍 Scan for Drift", key="drift_scan",
-                         use_container_width=True,
-                         disabled=st.session_state.thinking):
-                st.session_state.drift_job_id = start_drift_job(
-                    user=get_current_user())
-                st.rerun()
-
-        # Show results
         if _drift:
             if _drift.get("clean"):
                 st.markdown(
-                    "<div style='font-family:JetBrains Mono;font-size:0.7rem;"
-                    "color:#3fb950;padding:6px 0'>✅ No drift — GCP matches state</div>",
+                    "<div style='background:#052E1A;border:0.5px solid #14532D;border-radius:8px;"
+                    "padding:10px 12px;font-size:0.78rem;color:#4ADE80'>✓ No drift — GCP matches Terraform state</div>",
                     unsafe_allow_html=True)
             else:
-                deleted  = _drift.get("deleted", [])
-                modified = _drift.get("modified", [])
+                st.warning(_drift.get("summary","Drift detected."))
+                if _drift.get("how_to_fix"):
+                    with st.expander("How to fix", expanded=True):
+                        st.markdown(_drift.get("how_to_fix",""))
 
-                if deleted:
-                    st.markdown(
-                        f"<div style='font-family:JetBrains Mono;font-size:0.67rem;"
-                        f"color:#f85149;margin:4px 0'>"
-                        f"🗑️ <b>{len(deleted)} deleted</b> in GCP console:</div>",
-                        unsafe_allow_html=True)
-                    for r in deleted:
-                        st.markdown(
-                            f"<div style='font-family:JetBrains Mono;font-size:0.62rem;"
-                            f"color:#ff7b72;padding:2px 0 2px 10px'>"
-                            f"• {r['address']}</div>",
-                            unsafe_allow_html=True)
-
-                if modified:
-                    st.markdown(
-                        f"<div style='font-family:JetBrains Mono;font-size:0.67rem;"
-                        f"color:#d29922;margin:4px 0'>"
-                        f"✏️ <b>{len(modified)} modified</b> outside Terraform:</div>",
-                        unsafe_allow_html=True)
-                    for r in modified:
-                        st.markdown(
-                            f"<div style='font-family:JetBrains Mono;font-size:0.62rem;"
-                            f"color:#e3b341;padding:2px 0 2px 10px'>"
-                            f"• {r['address']}</div>",
-                            unsafe_allow_html=True)
-
-                st.markdown("<div style='margin:8px 0'></div>", unsafe_allow_html=True)
-                _fc1, _fc2 = st.columns(2)
+                _fc1, _fc2, _fc3 = st.columns(3)
                 with _fc1:
-                    if st.button("🧹 Accept deletions\n(clean state)",
-                                 key="drift_accept", use_container_width=True,
-                                 disabled=not deleted):
-                        st.session_state.drift_fix_job_id = start_drift_fix_job(
-                            _drift, "remove_state", user=get_current_user())
-                        st.rerun()
-                with _fc2:
-                    if st.button("🔄 Reconcile state\n(sync to GCP)",
-                                 key="drift_reconcile", use_container_width=True):
+                    if (st.button("Reconcile state", key="d_reconcile", use_container_width=True)
+                            and not st.session_state.ready_to_apply):
                         st.session_state.drift_fix_job_id = start_drift_fix_job(
                             _drift, "reconcile", user=get_current_user())
                         st.rerun()
+                with _fc2:
+                    if (st.button("Revert to code", key="d_revert", use_container_width=True)
+                            and not st.session_state.ready_to_apply):
+                        st.session_state.drift_fix_job_id = start_drift_fix_job(
+                            _drift, "revert", user=get_current_user())
+                        st.rerun()
+                with _fc3:
+                    if st.button("Clean state", key="d_rm", use_container_width=True):
+                        st.session_state.drift_fix_job_id = start_drift_fix_job(
+                            _drift, "remove_state", user=get_current_user())
+                        st.rerun()
 
-            # Rescan button
-            if st.button("🔁 Re-scan", key="drift_rescan", use_container_width=True):
-                st.session_state.drift_result = None
+            if st.button("Re-scan", key="drift_rescan", use_container_width=True):
+                st.session_state.drift_result    = None
+                st.session_state.drift_job_id    = start_drift_job(user=get_current_user())
+                st.rerun()
+        else:
+            if st.button("Scan for drift", key="drift_scan_btn", use_container_width=True):
                 st.session_state.drift_job_id = start_drift_job(user=get_current_user())
                 st.rerun()
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 5 — DEPLOY (repo URL → analyse → plan → apply)
+    # ═══════════════════════════════════════════════════════════════════════
+    with _tab_deploy:
+
+        # ── Stage indicator helper ────────────────────────────────────
+        def _stage_bar(active: int):
+            """Render a 4-stage progress bar. active=1..4"""
+            stages  = ["Connect", "Analyse", "Plan", "Apply"]
+            icons   = ["🔗", "🤖", "📋", "🚀"]
+            colors  = ["#4d9eff", "#a78bfa", "#f59e0b", "#22c55e"]
+            parts   = []
+            for i, (s, ic, c) in enumerate(zip(stages, icons, colors), 1):
+                done  = i < active
+                cur   = i == active
+                col   = c if (done or cur) else "#30363d"
+                dot   = "●" if done else ("◉" if cur else "○")
+                bold  = "font-weight:600;" if cur else ""
+                parts.append(
+                    f"<span style='color:{col};{bold}font-size:0.62rem'>"
+                    f"{dot} {ic} {s}</span>")
+            html = " <span style='color:#30363d;font-size:0.6rem'>──</span> ".join(parts)
+            st.markdown(
+                f"<div style='margin:0 0 12px;letter-spacing:0.03em'>{html}</div>",
+                unsafe_allow_html=True)
+
+        # ── Poll running deploy job ───────────────────────────────────
+        _dep_jid = st.session_state.deploy_job_id
+        if _dep_jid:
+            _dj   = get_job(_dep_jid)
+            _dst  = _dj.get("status", "running")
+            _logs = _dj.get("logs", [])
+
+            if _dst == "running":
+                # Detect current stage from logs
+                _stage = 1
+                for lg in _logs:
+                    if "Cloning" in lg or "Cloned" in lg:   _stage = max(_stage, 1)
+                    if "Scanning" in lg or "Gemini" in lg:  _stage = max(_stage, 2)
+                    if "terraform plan" in lg.lower():       _stage = max(_stage, 3)
+                _stage_bar(_stage)
+
+                # Live log feed
+                st.markdown(
+                    "<div style='font-family:JetBrains Mono;font-size:0.62rem;"
+                    "background:#0d1117;border:0.5px solid #21262d;border-radius:6px;"
+                    "padding:8px 10px;max-height:140px;overflow-y:auto'>",
+                    unsafe_allow_html=True)
+                for lg in _logs[-8:]:
+                    icon = "✅" if lg.startswith("✅") else \
+                           "❌" if lg.startswith("❌") else \
+                           "⚠️" if lg.startswith("⚠️") else "·"
+                    col  = "#22c55e" if "✅" in icon else \
+                           "#f85149" if "❌" in icon else \
+                           "#f59e0b" if "⚠️" in icon else "#8b949e"
+                    safe = lg.replace("<","&lt;").replace(">","&gt;")
+                    st.markdown(
+                        f"<div style='color:{col};margin-bottom:1px'>{safe}</div>",
+                        unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                if st.button("✕ Cancel", key="deploy_cancel",
+                             use_container_width=True):
+                    st.session_state.deploy_job_id = None
+                    TerraformTools.revert_to_snapshot()
+                    st.rerun()
+
+                time.sleep(1.5); st.rerun()
+
+            elif _dst in ("done", "error"):
+                _dr   = (_dj.get("result") or {})
+                _meta = _dr.get("deploy_meta", {})
+
+                if _dr.get("status") == "error" or _dst == "error":
+                    _stage_bar(2)
+                    _emsg = _dr.get("message", "Deploy analysis failed.")
+                    st.markdown(
+                        f"<div style='background:#1a0505;border:0.5px solid #f85149;"
+                        f"border-radius:8px;padding:12px 14px;font-size:0.8rem;"
+                        f"color:#f85149;margin-bottom:10px'>"
+                        f"<div style='font-weight:600;margin-bottom:4px'>❌ Deploy failed</div>"
+                        f"<div style='font-size:0.72rem;line-height:1.6'>{_emsg}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True)
+                    if st.button("↩ Try again", key="deploy_retry",
+                                 use_container_width=True):
+                        st.session_state.deploy_job_id = None
+                        st.rerun()
+
+                else:
+                    _stage_bar(3)
+
+                    # ── Success summary card ──────────────────────────
+                    _app   = _meta.get("app_name","")
+                    _env   = _meta.get("environment","production")
+                    _type  = _meta.get("project_type","app")
+                    _repo  = (_meta.get("repo_url","").split("/")[-1]
+                              .replace(".git",""))
+                    _adds  = len(_dr.get("plan_details",{}).get("add",[]))
+                    _cost  = (_dr.get("cost_estimate") or {}).get("total_monthly",0)
+                    _secs  = _dr.get("security_audit") or []
+                    _high  = sum(1 for f in _secs if f.get("severity")=="HIGH")
+
+                    st.markdown(
+                        f"<div style='background:#0d1117;border:0.5px solid #21262d;"
+                        f"border-left:3px solid #22c55e;border-radius:0 8px 8px 0;"
+                        f"padding:12px 14px;margin-bottom:10px'>"
+                        f"<div style='font-size:0.68rem;color:#22c55e;font-weight:600;"
+                        f"margin-bottom:6px'>✅ PLAN READY</div>"
+                        f"<div style='font-size:0.82rem;color:#c9d1d9;font-weight:600;"
+                        f"margin-bottom:8px'>{_app or _repo}</div>"
+                        f"<div style='display:flex;gap:14px;font-size:0.68rem;color:#8b949e'>"
+                        f"<span>📦 {_type}</span>"
+                        f"<span>🌍 {_env}</span>"
+                        f"<span>➕ {_adds} resource(s)</span>"
+                        f"{'<span>💰 $'+str(round(_cost,2))+'/mo</span>' if _cost else ''}"
+                        f"{'<span style=color:#f59e0b>⚠️ '+str(_high)+' HIGH sec</span>' if _high else ''}"
+                        f"</div>"
+                        f"</div>",
+                        unsafe_allow_html=True)
+
+                    # Dockerfile push hint
+                    if _meta.get("has_dockerfile"):
+                        _img = _meta.get("image_hint","gcr.io/PROJECT/APP:latest")
+                        st.markdown(
+                            f"<div style='background:#130d00;border:0.5px solid #f59e0b;"
+                            f"border-radius:8px;padding:10px 12px;font-size:0.72rem;"
+                            f"color:#f59e0b;margin-bottom:10px'>"
+                            f"<div style='font-weight:600;margin-bottom:4px'>"
+                            f"⚠️ Push Docker image first</div>"
+                            f"<div style='font-family:JetBrains Mono;font-size:0.62rem;"
+                            f"color:#d4a017;margin-top:4px;white-space:pre-wrap'>"
+                            f"gcloud builds submit --tag {_img} .</div>"
+                            f"</div>",
+                            unsafe_allow_html=True)
+
+                    # sre.yaml hint if not present
+                    if not _meta.get("has_sre_yaml"):
+                        st.markdown(
+                            "<div style='background:#0a0d13;border:0.5px solid #1d4ed8;"
+                            "border-radius:8px;padding:8px 12px;font-size:0.68rem;"
+                            "color:#60a5fa;margin-bottom:10px'>"
+                            "💡 Add <code>sre.yaml</code> to your repo root to control "
+                            "memory, CPU, environment triggers, and secrets.</div>",
+                            unsafe_allow_html=True)
+
+                    # Push plan to chat + set ready_to_apply
+                    _dc1, _dc2 = st.columns([3, 2])
+                    with _dc1:
+                        if st.button("🚀 Apply Deployment", key="deploy_apply_btn",
+                                     use_container_width=True,
+                                     disabled=st.session_state.thinking):
+                            st.session_state.messages.append({
+                                "role": "user",
+                                "content": f"🚀 Deploy `{_app or _repo}` to {_env}"
+                            })
+                            st.session_state.messages.append({
+                                "role":    "assistant",
+                                "type":    "success",
+                                "content": _dr.get("message",""),
+                                "action":  "apply",
+                                "plan_details":   _dr.get("plan_details",{}),
+                                "is_destroy":     False,
+                                "has_warn":       False,
+                                "pending_count":  _adds,
+                                "cost_estimate":  _dr.get("cost_estimate"),
+                                "security_audit": _secs,
+                                "auto_fixed":     [],
+                                "is_rollback":    False,
+                                "rollback_version": None,
+                            })
+                            st.session_state.ready_to_apply   = True
+                            st.session_state.plan_ts          = time.time()
+                            st.session_state.is_destroy       = False
+                            st.session_state["_last_action"]         = "apply"
+                            st.session_state["_last_action_idx"]     = \
+                                len(st.session_state.messages) - 1
+                            st.session_state["_last_action_pcount"]  = _adds
+                            st.session_state.deploy_job_id = None
+                            # Save to deploy history
+                            if "deploy_history" not in st.session_state:
+                                st.session_state.deploy_history = []
+                            st.session_state.deploy_history.insert(0, {
+                                "repo":    _repo,
+                                "app":     _app,
+                                "env":     _env,
+                                "type":    _type,
+                                "ts":      datetime.utcnow().strftime("%H:%M %d/%m"),
+                                "status":  "applying",
+                            })
+                            st.rerun()
+                    with _dc2:
+                        if st.button("✕ Discard", key="deploy_discard",
+                                     use_container_width=True):
+                            TerraformTools.revert_to_snapshot()
+                            st.session_state.deploy_job_id = None
+                            st.rerun()
+
+        # ── Deploy Form (idle state) ──────────────────────────────────
+        if not _dep_jid:
+
+            # ── Repo URL — primary input ──────────────────────────────
+            _url_val = st.session_state.deploy_repo_url
+            _new_url = st.text_input(
+                "Git repository URL",
+                value=_url_val,
+                placeholder="https://github.com/owner/my-app",
+                key="deploy_url_input")
+            st.session_state.deploy_repo_url = _new_url
+
+            # URL validation hint
+            _url_ok = _new_url.strip().startswith("https://") or \
+                      _new_url.strip().startswith("http://")
+            if _new_url.strip() and not _url_ok:
+                st.markdown(
+                    "<div style='font-size:0.65rem;color:#f85149;margin:-6px 0 6px'>"
+                    "⚠️ Must start with https://</div>",
+                    unsafe_allow_html=True)
+
+            # ── Prompt — the key differentiator ──────────────────────
+            _new_prompt = st.text_area(
+                "What do you want to deploy?",
+                value=st.session_state.deploy_prompt,
+                placeholder=(
+                    "e.g. Deploy this FastAPI app to Cloud Run\n"
+                    "     with 512MB RAM, 2 CPUs, public HTTPS access\n\n"
+                    "e.g. Deploy as a private staging service with 0 min instances\n\n"
+                    "e.g. This is a Next.js static site, deploy to GCS with CDN"),
+                height=100,
+                key="deploy_prompt_input")
+            st.session_state.deploy_prompt = _new_prompt
+
+            # ── Config row ────────────────────────────────────────────
+            _c1, _c2, _c3 = st.columns(3)
+            with _c1:
+                _envs = ["production", "staging", "dev"]
+                _ei   = _envs.index(st.session_state.deploy_env) \
+                        if st.session_state.deploy_env in _envs else 0
+                st.session_state.deploy_env = st.selectbox(
+                    "Environment", _envs, index=_ei, key="dep_env")
+            with _c2:
+                st.session_state.deploy_branch = st.text_input(
+                    "Branch",
+                    value=st.session_state.deploy_branch or "main",
+                    placeholder="main", key="dep_branch")
+            with _c3:
+                st.session_state.deploy_app_name = st.text_input(
+                    "App name",
+                    value=st.session_state.deploy_app_name,
+                    placeholder="auto",
+                    key="dep_name",
+                    help="Leave blank to auto-detect from repo name")
+
+            # ── Private repo token ────────────────────────────────────
+            with st.expander("🔑 Private repository", expanded=False):
+                st.session_state.deploy_token = st.text_input(
+                    "Access token",
+                    value=st.session_state.deploy_token,
+                    type="password",
+                    placeholder="ghp_... (GitHub PAT) or GitLab deploy token",
+                    key="dep_token")
+                st.markdown(
+                    "<div style='font-size:0.62rem;color:#484f58;margin-top:4px'>"
+                    "Used only to clone — never stored after this session.</div>",
+                    unsafe_allow_html=True)
+
+            # ── Deploy button ─────────────────────────────────────────
+            _ready = _url_ok and _new_url.strip()
+            st.markdown("<div style='margin-top:6px'>", unsafe_allow_html=True)
+            if st.button(
+                "🚀 Analyse & Plan",
+                key="deploy_btn",
+                use_container_width=True,
+                disabled=not _ready or bool(st.session_state.thinking)):
+
+                _url    = _new_url.strip()
+                _branch = st.session_state.deploy_branch.strip() or "main"
+                _name   = st.session_state.deploy_app_name.strip()
+                _env    = st.session_state.deploy_env
+                _prompt = st.session_state.deploy_prompt.strip()
+                _token  = st.session_state.deploy_token.strip()
+
+                st.session_state.deploy_job_id = start_deploy_job(
+                    repo_url    = _url,
+                    branch      = _branch,
+                    app_name    = _name,
+                    environment = _env,
+                    user_prompt = _prompt,
+                    repo_token  = _token,
+                    user        = get_current_user(),
+                )
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            # ── What happens hint ─────────────────────────────────────
+            st.markdown(
+                "<div style='font-size:0.6rem;color:#30363d;margin-top:10px;"
+                "line-height:1.9;border-top:0.5px solid #21262d;padding-top:8px'>"
+                "🔗 Clone repo &nbsp;→&nbsp; "
+                "🤖 Gemini analyses stack &nbsp;→&nbsp; "
+                "📋 Terraform plan + cost &nbsp;→&nbsp; "
+                "🚀 One-click apply"
+                "</div>",
+                unsafe_allow_html=True)
+
+            # ── Deploy history ────────────────────────────────────────
+            _hist = st.session_state.get("deploy_history", [])
+            if _hist:
+                st.markdown(
+                    "<div style='font-size:0.68rem;font-weight:600;color:#484f58;"
+                    "margin:14px 0 6px'>Recent deployments</div>",
+                    unsafe_allow_html=True)
+                for _rec in _hist[:5]:
+                    _s   = _rec.get("status","done")
+                    _sc  = "#22c55e" if _s=="done" else \
+                           "#f59e0b" if _s=="applying" else "#8b949e"
+                    _dot = "●"
+                    st.markdown(
+                        f"<div style='display:flex;align-items:center;gap:8px;"
+                        f"font-size:0.68rem;color:#8b949e;padding:3px 0;"
+                        f"border-bottom:0.5px solid #21262d'>"
+                        f"<span style='color:{_sc}'>{_dot}</span>"
+                        f"<span style='color:#c9d1d9;font-weight:500'>"
+                        f"{_rec.get('app') or _rec.get('repo','?')}</span>"
+                        f"<span style='color:#484f58'>{_rec.get('env','')}</span>"
+                        f"<span style='margin-left:auto'>{_rec.get('ts','')}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True)
+
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 # =============================================================================
 # LEFT PANEL — Chat  (full-height, buttons outside scroll container)
@@ -1285,25 +1446,35 @@ with col_chat:
     with chat_area:
         if not st.session_state.messages:
             st.markdown("""
-            <div style='text-align:center; padding:4rem 2rem; color:#484f58;'>
-                <div style='font-size:2.5rem; margin-bottom:1rem'>☁️</div>
-                <p style='color:#8b949e; font-weight:600; font-size:0.95rem; margin:0'>
-                    AI SRE Agent — Google Cloud
-                </p>
-                <p style='font-size:0.8rem; color:#484f58; margin-top:0.5rem'>
-                    Describe any GCP infrastructure — I'll write the Terraform,<br>
-                    validate it, and show you the plan before applying.
-                </p>
-                <div style='display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-top:1.5rem;'>
-                    <div style='background:#161b22; border:1px solid #30363d; border-radius:8px;
-                                padding:8px 14px; font-size:0.78rem; color:#8b949e;'>🪣 GCS bucket in europe-west2</div>
-                    <div style='background:#161b22; border:1px solid #30363d; border-radius:8px;
-                                padding:8px 14px; font-size:0.78rem; color:#8b949e;'>🖥️ Compute VM in asia-southeast1</div>
-                    <div style='background:#161b22; border:1px solid #30363d; border-radius:8px;
-                                padding:8px 14px; font-size:0.78rem; color:#8b949e;'>⎈ GKE cluster + node pool</div>
-                    <div style='background:#161b22; border:1px solid #30363d; border-radius:8px;
-                                padding:8px 14px; font-size:0.78rem; color:#8b949e;'>🗑️ Remove resource X</div>
-                </div>
+            <div style='display:flex;flex-direction:column;align-items:center;
+                        justify-content:center;height:100%;padding:3rem 2rem;gap:0'>
+              <div style='width:48px;height:48px;background:#1E1B4B;border-radius:14px;
+                          display:flex;align-items:center;justify-content:center;
+                          font-size:22px;margin-bottom:16px'>⬡</div>
+              <p style='color:#F4F4F5;font-weight:600;font-size:1rem;margin:0 0 6px'>
+                What do you want to build?
+              </p>
+              <p style='font-size:0.8rem;color:#52525B;margin:0 0 24px;text-align:center;max-width:320px'>
+                Describe any GCP infrastructure — I'll write the Terraform,
+                validate it and show you the plan before applying.
+              </p>
+              <div style='display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:420px'>
+                <div style='background:#18181B;border:0.5px solid #3F3F46;border-radius:8px;
+                            padding:7px 13px;font-size:0.78rem;color:#A1A1AA;cursor:default'>
+                  GCS bucket in europe-west2</div>
+                <div style='background:#18181B;border:0.5px solid #3F3F46;border-radius:8px;
+                            padding:7px 13px;font-size:0.78rem;color:#A1A1AA;cursor:default'>
+                  VM in us-central1 ubuntu 24</div>
+                <div style='background:#18181B;border:0.5px solid #3F3F46;border-radius:8px;
+                            padding:7px 13px;font-size:0.78rem;color:#A1A1AA;cursor:default'>
+                  GKE cluster + node pool</div>
+                <div style='background:#18181B;border:0.5px solid #3F3F46;border-radius:8px;
+                            padding:7px 13px;font-size:0.78rem;color:#A1A1AA;cursor:default'>
+                  List all running VMs</div>
+                <div style='background:#18181B;border:0.5px solid #3F3F46;border-radius:8px;
+                            padding:7px 13px;font-size:0.78rem;color:#A1A1AA;cursor:default'>
+                  Check infrastructure drift</div>
+              </div>
             </div>""", unsafe_allow_html=True)
         else:
             for idx, msg in enumerate(st.session_state.messages):
@@ -1575,7 +1746,7 @@ with col_chat:
                 f"</div>", unsafe_allow_html=True)
             fix_cols = st.columns([2, 8])
             with fix_cols[0]:
-                fix_label = f"🔒 Fix {len(_fixable_ids)} Security Issue(s)"
+                fix_label = f"Fix {len(_fixable_ids)} security issue(s)"
                 if st.button(fix_label, key="action_fix_security", use_container_width=True):
                     if require_admin("fixing security issues"):
                         fix_msg = f"fix security issues: {', '.join(_fixable_ids)}"
@@ -1614,10 +1785,10 @@ with col_chat:
         if _action == "apply":
             with btn_cols[0]:
                 st.markdown('<div class="btn-apply">', unsafe_allow_html=True)
-                label = f"🚀 Apply ({_pcount} new)" if _pcount else "🚀 Apply Changes"
+                label = f"Apply  ({_pcount} new)" if _pcount else "Apply changes"
                 if st.session_state.is_rollback:
                     rv = st.session_state.rollback_version or {}
-                    label = f"⏪ Confirm Rollback → {rv.get('version_id','')[:15]}"
+                    label = f"Confirm rollback  {rv.get('version_id','')[:12]}"
                 if st.button(label, key="action_apply", use_container_width=True):
                     if require_admin("applying infrastructure changes"):
                         st.session_state.apply_job_id     = start_apply_job(user=get_current_user())
@@ -1631,7 +1802,7 @@ with col_chat:
                         st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
             with btn_cols[1]:
-                if st.button("❌ Discard Plan", key="action_discard_apply",
+                if st.button("Discard plan", key="action_discard_apply",
                              use_container_width=True):
                     _discard_plan(_action_idx)
                     st.rerun()
@@ -1639,7 +1810,7 @@ with col_chat:
         elif _action == "destroy":
             with btn_cols[0]:
                 st.markdown('<div class="btn-destroy">', unsafe_allow_html=True)
-                if st.button("💣 Confirm Destroy", key="action_destroy", use_container_width=True):
+                if st.button("Confirm destroy", key="action_destroy", use_container_width=True):
                     if require_admin("destroying infrastructure"):
                         st.session_state.apply_job_id   = start_apply_job(
                             is_destroy=True,
@@ -1653,14 +1824,14 @@ with col_chat:
                         st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
             with btn_cols[1]:
-                if st.button("❌ Cancel", key="action_cancel_d", use_container_width=True):
+                if st.button("Cancel", key="action_cancel_d", use_container_width=True):
                     _discard_plan(_action_idx)
                     st.rerun()
 
         elif _action == "warn_destroy":
             with btn_cols[0]:
                 st.markdown('<div class="btn-destroy">', unsafe_allow_html=True)
-                if st.button("⚠️ Apply Anyway", key="action_warn", use_container_width=True):
+                if st.button("Apply anyway", key="action_warn", use_container_width=True):
                     if require_admin("applying destructive changes"):
                         st.session_state.apply_job_id   = start_apply_job(user=get_current_user())
                         st.session_state.ready_to_apply = False
@@ -1671,7 +1842,7 @@ with col_chat:
                         st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
             with btn_cols[1]:
-                if st.button("❌ Cancel", key="action_cancel_w", use_container_width=True):
+                if st.button("Cancel", key="action_cancel_w", use_container_width=True):
                     _discard_plan(_action_idx)
                     st.rerun()
 
@@ -1743,6 +1914,22 @@ with col_chat:
                     "type":    "query",
                     "content": result.get("message", ""),
                     "query_meta": result.get("query_meta", {}),
+                })
+            elif r == "drift":
+                # Drift result from agent — populate the drift panel
+                drift = result.get("drift") or {}
+                st.session_state.drift_result = drift
+                st.session_state.drift_job_id = None
+                # Also add a chat bubble summarising the result
+                summary = drift.get("summary", "Drift check complete.")
+                how_to  = drift.get("how_to_fix", "")
+                content = summary
+                if how_to and not drift.get("clean"):
+                    content += f"\n\n{how_to}"
+                st.session_state.messages.append({
+                    "role":    "assistant",
+                    "type":    "info",
+                    "content": content,
                 })
             elif r == "info":
                 st.session_state.messages.append({
@@ -1836,7 +2023,7 @@ with col_chat:
                                               "" if k == "voice_command" else None
                     st.rerun()
         with bcol2:
-            if st.button("🔄 Refresh", use_container_width=True):
+            if st.button("Refresh", use_container_width=True):
                 st.rerun()
 
     # ── Tab: Voice ────────────────────────────────────────────────────────────
@@ -1880,7 +2067,7 @@ with col_chat:
 
         # ── Transcribe button ─────────────────────────────────────────────
         if _abytes and not _jid and not _cmd:
-            if st.button("🎙️ Transcribe", key="voice_transcribe",
+            if st.button("Transcribe", key="voice_transcribe",
                          use_container_width=True):
                 st.session_state.voice_audio_bytes = None  # consumed
                 st.session_state.voice_job_id = start_voice_job(
@@ -1949,7 +2136,7 @@ with col_chat:
 
             s_col, d_col = st.columns([3, 2])
             with s_col:
-                if st.button("➤ Send to Agent", key="voice_send",
+                if st.button("Send to agent", key="voice_send",
                              use_container_width=True,
                              disabled=st.session_state.thinking):
                     cmd_to_send = st.session_state.voice_command
@@ -1964,7 +2151,7 @@ with col_chat:
                     st.session_state.thinking       = True
                     st.rerun()
             with d_col:
-                if st.button("🗑️ Discard", key="voice_clear",
+                if st.button("Discard", key="voice_clear",
                              use_container_width=True):
                     st.session_state.voice_command     = ""
                     st.session_state.voice_audio_bytes = None

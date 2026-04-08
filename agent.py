@@ -1699,8 +1699,8 @@ Your job: generate COMPLETE, VALID Terraform HCL for any Google Cloud resource t
 ## OUTPUT FORMAT
 Always respond with a JSON object:
 {
-  "action": "write" | "destroy" | "apply_target" | "fix_security" | "query" | "info",
-  "hcl": "<NEW blocks only — NOT the full file. Empty string for destroy/fix_security/info/query>",
+  "action": "write" | "destroy" | "apply_target" | "fix_security" | "check_drift" | "query" | "deploy" | "info",
+  "hcl": "<NEW blocks only — NOT the full file. Empty string for destroy/fix_security/info/query/deploy>",
   "resource_name": "<single logical name — only for single-resource context>",
   "resource_type": "<google_resource_type>",
   "destroy_targets": [{"type": "google_compute_instance", "name": "vm_name"}],
@@ -1714,8 +1714,34 @@ Always respond with a JSON object:
     "minutes": 60,
     "filter": "<optional log filter string>"
   },
+  "deploy": {
+    "repo_url":    "<https://github.com/owner/repo or other git URL>",
+    "branch":      "<branch name, default main>",
+    "app_name":    "<name for the deployed service>",
+    "environment": "<production|staging|dev>",
+    "prompt":      "<user's original deployment intent in plain English>"
+  },
   "message": "<explanation to user>"
 }
+
+## RULES FOR deploy action
+Use action="deploy" when the user wants to deploy an application from a git repository:
+- "deploy my app from https://github.com/..." → deploy action
+- "deploy the repo https://..." → deploy action
+- "deploy app XYZ to production" with a URL → deploy action
+Extract: repo_url (required), branch (default main), app_name (from repo name or user), environment, prompt.
+Set hcl="" — the deploy engine reads the repo and generates HCL itself.
+
+## RULES FOR check_drift action
+Use action="check_drift" when the user asks about drift, infrastructure changes, or state vs reality:
+- "check infrastructure drift"
+- "check drift" / "detect drift" / "show drift"
+- "has anything changed outside terraform"
+- "is my infrastructure in sync"
+- "what changed in GCP console"
+- "terraform state vs reality"
+Set hcl="" and message="Checking infrastructure drift..." for this action.
+Do NOT use query action for drift — check_drift runs terraform plan -refresh-only which is the correct tool.
 
 ## RULES FOR query action
 Use action="query" when the user asks about the STATE or METRICS of existing GCP resources:
@@ -1890,6 +1916,29 @@ def _agent_worker(jid: str, messages: list):
         latest_msg = next(
             (m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         detected_region = extract_region_from_prompt(latest_msg)
+
+        # ── Keyword fast-path: drift detection ───────────────────────────────
+        # Intercept obvious drift phrases before calling Gemini — avoids the
+        # model routing them to the generic "query" action.
+        _drift_keywords = (
+            "check drift", "check infrastructure drift", "detect drift",
+            "infrastructure drift", "show drift", "drift detection",
+            "terraform drift", "state drift", "infra drift",
+            "has anything changed", "what changed outside terraform",
+            "is my infrastructure in sync", "sync check",
+            "refresh-only", "plan refresh",
+        )
+        _msg_lower = latest_msg.lower().strip()
+        if any(kw in _msg_lower for kw in _drift_keywords):
+            _log(jid, "🔍 Drift keyword detected — running terraform plan -refresh-only…")
+            drift = detect_drift(jid)
+            _finish(jid, {
+                "status":  "drift",
+                "drift":   drift,
+                "message": drift.get("summary", ""),
+            })
+            return
+        # ─────────────────────────────────────────────────────────────────────
 
         if detected_region:
             if detected_region != GCP_DEFAULT_REGION:
@@ -2222,6 +2271,17 @@ def _agent_worker(jid: str, messages: list):
                 })
                 return
 
+            # ── Check drift — runs terraform plan -refresh-only ───────────────
+            if action == "check_drift":
+                _log(jid, "🔍 Running drift detection…")
+                drift = detect_drift(jid)
+                _finish(jid, {
+                    "status":  "drift",
+                    "drift":   drift,
+                    "message": drift.get("summary", ""),
+                })
+                return
+
             # ── Query — live GCP observability ────────────────────────────
             if action == "query":
                 q = decision.get("query") or {}
@@ -2231,6 +2291,47 @@ def _agent_worker(jid: str, messages: list):
                     "status":     "query",
                     "message":    answer,
                     "query_meta": q,
+                })
+                return
+
+            # ── Deploy — repo → analyse → HCL → plan → ready to apply ────
+            if action == "deploy":
+                d = decision.get("deploy") or {}
+                repo_url = d.get("repo_url", "")
+                if not repo_url:
+                    _finish(jid, {"status": "info",
+                                  "message": "❌ No repository URL found. Please provide the full URL, e.g. https://github.com/owner/repo"})
+                    return
+                _log(jid, f"🚀 Starting deployment from {repo_url}")
+                deploy_result = _run_repo_deploy(
+                    repo_url    = repo_url,
+                    branch      = d.get("branch", "main"),
+                    app_name    = d.get("app_name", ""),
+                    environment = d.get("environment", "production"),
+                    user_prompt = d.get("prompt", ""),
+                    jid         = jid,
+                    user        = JOBS[jid].get("_user", "unknown"),
+                )
+                if deploy_result.get("error"):
+                    _error(jid, deploy_result["error"])
+                    return
+                # deploy engine wrote HCL to main.tf and ran plan
+                plan         = deploy_result["plan"]
+                current_code = TerraformTools.read_code()
+                plan_details = parse_plan_details(plan, current_code)
+                cost_est     = estimate_plan_cost(plan_details, current_code, jid)
+                security     = audit_security(current_code, plan_details, jid)
+                _finish(jid, {
+                    "status":         "success",
+                    "plan":           plan,
+                    "plan_details":   plan_details,
+                    "cost_estimate":  cost_est,
+                    "security_audit": security,
+                    "auto_fixed":     [],
+                    "is_destroy":     False,
+                    "deploy_meta":    deploy_result.get("meta", {}),
+                    "message":        deploy_result.get("message", "Deployment plan ready."),
+                    "collateral_warning": [],
                 })
                 return
 
@@ -2293,6 +2394,7 @@ def _apply_worker(jid: str, is_destroy: bool = False, destroy_target: dict = Non
             TerraformTools.save_version(
                 label=f"destroy: {d_name if d_name not in ('__ALL__','__TYPE_ALL__') else ('all resources' if d_name=='__ALL__' else f'all {d_type}')}",
                 user=JOBS[jid].get("_user", "system"), action="destroy")
+            _push_main_tf_to_gcs(jid)
             _redis_publish("destroy:done", {
                 "job_id": jid, "user": JOBS[jid].get("_user", "system"),
                 "destroyed": [t["name"] for t in (d_targets or [{"name": d_name}])],
@@ -2311,6 +2413,7 @@ def _apply_worker(jid: str, is_destroy: bool = False, destroy_target: dict = Non
             TerraformTools.save_version(
                 label=f"apply-target: {names}",
                 user=JOBS[jid].get("_user", "system"), action="apply_target")
+            _push_main_tf_to_gcs(jid)
             _redis_publish("apply:done", {
                 "job_id":      jid,
                 "user":        JOBS[jid].get("_user", "system"),
@@ -2342,6 +2445,7 @@ def _apply_worker(jid: str, is_destroy: bool = False, destroy_target: dict = Non
             TerraformTools.save_version(
                 label="apply",
                 user=JOBS[jid].get("_user", "system"), action="apply")
+            _push_main_tf_to_gcs(jid)
             # Publish apply:done for A7 UI Navigator to verify
             current_code = TerraformTools.read_code()
             resources = [{"type": t, "name": n}
@@ -2439,6 +2543,37 @@ def start_rollback_job(version_id: str, user: str = "unknown") -> str:
 
     threading.Thread(target=_worker, daemon=True).start()
     return jid
+
+
+def _push_main_tf_to_gcs(jid: str = None):
+    """
+    Upload main.tf (and provider.tf, backend.tf) to GCS after every apply.
+    This ensures drift detection can restore config files on Cloud Run cold starts.
+    Files saved under the same bucket as tfstate, at root level.
+    """
+    state_bucket = os.environ.get("TF_STATE_BUCKET", "")
+    if not state_bucket:
+        return
+    try:
+        from google.cloud import storage as _gcs
+        client = _gcs.Client()
+        bucket = client.bucket(state_bucket)
+        pushed = []
+        for fname in ("main.tf", "provider.tf", "backend.tf"):
+            fpath = f"{TF_DIR}/{fname}"
+            if os.path.exists(fpath) and open(fpath).read().strip():
+                bucket.blob(fname).upload_from_filename(
+                    fpath, content_type="text/plain")
+                pushed.append(fname)
+        if pushed and jid:
+            _log(jid, f"☁️  Config files saved to GCS: {', '.join(pushed)}")
+        elif jid:
+            _log(jid, "⚠️  No config files to push to GCS")
+    except Exception as exc:
+        if jid:
+            _log(jid, f"⚠️  GCS config push failed: {exc}")
+        else:
+            print(f"[gcs_push] {exc}")
 
 
 def start_state_push_job() -> str:
@@ -2969,6 +3104,398 @@ def _run_gcp_query(q: dict, jid: str) -> str:
                      for e in raw_data["log_entries"]]
             return "\n".join(lines)
         return f"Raw data: {json.dumps(raw_data)[:400]}"
+
+# ---------------------------------------------------------------------------
+# Repo Deploy Engine
+# Accepts a git repo URL + user prompt → analyses repo → generates Terraform
+# HCL via Gemini → writes to main.tf → runs plan → returns result for apply.
+#
+# Supports two scenarios:
+#   1. Chat/Voice: "deploy app from https://github.com/owner/repo"
+#   2. UI panel:   user pastes URL + optional prompt → calls start_deploy_job()
+#
+# Flow:
+#   clone repo → scan files → read sre.yaml (if exists) → Gemini analyses
+#   → generates Cloud Run / GCE / GKE HCL → write_code() → run_plan()
+# ---------------------------------------------------------------------------
+
+def _clone_repo(repo_url: str, branch: str, token: str = "") -> str:
+    """
+    Clone a git repo to a temp directory. Returns the local path.
+    Supports: public repos, GitHub token auth, GitLab token auth.
+    token: GitHub PAT or GitLab deploy token (optional for public repos).
+    """
+    import tempfile, shutil
+
+    # Inject token into URL if provided
+    auth_url = repo_url
+    if token:
+        if "github.com" in repo_url:
+            auth_url = repo_url.replace("https://", f"https://x-access-token:{token}@")
+        elif "gitlab.com" in repo_url:
+            auth_url = repo_url.replace("https://", f"https://oauth2:{token}@")
+
+    dest = tempfile.mkdtemp(prefix="sre_repo_")
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", branch,
+             "--single-branch", auth_url, dest],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            # Try without branch (some repos use 'master')
+            result2 = subprocess.run(
+                ["git", "clone", "--depth", "1", auth_url, dest + "_2"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result2.returncode != 0:
+                shutil.rmtree(dest, ignore_errors=True)
+                raise RuntimeError(
+                    f"git clone failed: {result.stderr[:200] or result2.stderr[:200]}")
+            shutil.rmtree(dest, ignore_errors=True)
+            return dest + "_2"
+        return dest
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+def _scan_repo(repo_dir: str) -> dict:
+    """
+    Scan repo directory and return a structured summary:
+    - file tree (top 3 levels)
+    - detected project type
+    - sre.yaml contents if present
+    - existing *.tf files
+    - Dockerfile presence
+    - key config files (package.json, requirements.txt, etc.)
+    """
+    import yaml as _yaml
+
+    summary = {
+        "has_dockerfile":   False,
+        "has_tf_files":     False,
+        "has_sre_yaml":     False,
+        "has_docker_compose": False,
+        "project_type":     "unknown",
+        "languages":        [],
+        "sre_config":       {},
+        "tf_files":         [],
+        "file_tree":        [],
+        "key_files":        {},
+    }
+
+    lang_signals = {
+        "requirements.txt": "python",
+        "setup.py":         "python",
+        "pyproject.toml":   "python",
+        "package.json":     "nodejs",
+        "go.mod":           "golang",
+        "Cargo.toml":       "rust",
+        "pom.xml":          "java",
+        "build.gradle":     "java",
+        "Gemfile":          "ruby",
+    }
+
+    for root, dirs, files in os.walk(repo_dir):
+        # Skip hidden dirs and node_modules
+        dirs[:] = [d for d in dirs if not d.startswith(".")
+                   and d not in ("node_modules", ".git", "__pycache__", "vendor")]
+        rel = os.path.relpath(root, repo_dir)
+        depth = rel.count(os.sep)
+        if depth > 2:
+            continue
+
+        for f in files:
+            fpath = os.path.join(root, f)
+            rel_f = os.path.relpath(fpath, repo_dir)
+            summary["file_tree"].append(rel_f)
+
+            # Dockerfile
+            if f in ("Dockerfile", "dockerfile"):
+                summary["has_dockerfile"] = True
+                summary["project_type"]   = "docker"
+
+            # docker-compose
+            if f in ("docker-compose.yml", "docker-compose.yaml"):
+                summary["has_docker_compose"] = True
+
+            # Terraform files
+            if f.endswith(".tf"):
+                summary["has_tf_files"] = True
+                summary["tf_files"].append(rel_f)
+                try:
+                    summary["key_files"][rel_f] = open(fpath).read()[:1500]
+                except Exception:
+                    pass
+
+            # sre.yaml
+            if f in ("sre.yaml", "sre.yml"):
+                summary["has_sre_yaml"] = True
+                try:
+                    raw = open(fpath).read()
+                    try:
+                        import yaml as _y
+                        summary["sre_config"] = _y.safe_load(raw) or {}
+                    except Exception:
+                        summary["sre_config"] = {"_raw": raw[:500]}
+                except Exception:
+                    pass
+
+            # Language signals
+            if f in lang_signals and lang_signals[f] not in summary["languages"]:
+                summary["languages"].append(lang_signals[f])
+                try:
+                    summary["key_files"][f] = open(fpath).read()[:800]
+                except Exception:
+                    pass
+
+    # Infer project type if not set by Dockerfile
+    if summary["project_type"] == "unknown" and summary["languages"]:
+        summary["project_type"] = summary["languages"][0]
+
+    return summary
+
+
+def _gemini_analyse_repo(scan: dict, repo_url: str, app_name: str,
+                          environment: str, user_prompt: str, jid: str) -> str:
+    """
+    Ask Gemini to analyse the repo scan and generate Terraform HCL
+    for deploying this app to GCP. Returns raw HCL string.
+    """
+    _log(jid, "🤖 Gemini analysing repository…")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=3000,
+            temperature=0.1,
+        ),
+    )
+
+    region   = GCP_DEFAULT_REGION
+    project  = GCP_PROJECT_ID
+    sre_cfg  = scan.get("sre_config", {})
+    env_cfg  = (sre_cfg.get("environments") or {}).get(environment, {})
+
+    prompt = f"""You are an expert GCP infrastructure engineer.
+Analyse this repository and generate Terraform HCL to deploy it to GCP.
+
+Repository URL: {repo_url}
+App name: {app_name}
+Environment: {environment}
+GCP Project: {project}
+Region: {region}
+User request: "{user_prompt or 'Deploy this application'}"
+
+Repository scan:
+- Project type: {scan['project_type']}
+- Languages: {scan['languages']}
+- Has Dockerfile: {scan['has_dockerfile']}
+- Has existing .tf files: {scan['has_tf_files']}
+- Has sre.yaml: {scan['has_sre_yaml']}
+- sre.yaml config: {json.dumps(sre_cfg, indent=2)[:800]}
+- Key files: {json.dumps({k: v[:400] for k, v in scan.get('key_files', {}).items()}, indent=2)[:2000]}
+
+RULES:
+- NEVER generate provider "google" blocks or terraform {{}} blocks
+- Generate ONLY the resource/data blocks needed
+- Use image = "gcr.io/{project}/{app_name}:latest" for Cloud Run (customer will push their image)
+- If Dockerfile exists → deploy as google_cloud_run_v2_service
+- If has_tf_files but no Dockerfile → use existing tf structure, supplement missing resources
+- If static site (index.html, no backend) → deploy as google_storage_bucket with website config
+- If sre.yaml exists → follow its configuration exactly
+- Add google_cloud_run_v2_service_iam_member for allUsers if environment=production (public access)
+- Memory: {env_cfg.get('memory', '512Mi')}, CPU: {env_cfg.get('cpu', '1')}
+- Min instances: {env_cfg.get('min_instances', 0)}, Max: {env_cfg.get('max_instances', 3)}
+
+Return ONLY the Terraform HCL resource blocks. No explanation, no markdown fences."""
+
+    resp = model.generate_content(prompt)
+    raw  = (resp.text or "").strip()
+    raw  = re.sub(r'```(?:hcl|terraform)?\n?', '', raw)
+    raw  = re.sub(r'```', '', raw).strip()
+    return raw
+
+
+def _run_repo_deploy(repo_url: str, branch: str = "main", app_name: str = "",
+                     environment: str = "production", user_prompt: str = "",
+                     jid: str = "", user: str = "unknown",
+                     repo_token: str = "") -> dict:
+    """
+    Full repo deploy pipeline:
+    1. Clone repo
+    2. Scan files
+    3. Gemini generates HCL
+    4. write_code() → main.tf
+    5. run_plan()
+    Returns dict with plan, meta, message, or error key.
+    """
+    import shutil
+
+    repo_dir = None
+    try:
+        # ── Derive app name from repo URL if not given ─────────────────
+        if not app_name:
+            app_name = repo_url.rstrip("/").split("/")[-1]
+            app_name = re.sub(r'\.git$', '', app_name)
+            app_name = re.sub(r'[^a-z0-9\-]', '-', app_name.lower())[:30]
+
+        _log(jid, f"📦 Cloning {repo_url} (branch: {branch})…")
+
+        # ── Get optional token from env ─────────────────────────────────
+        if not repo_token:
+            repo_token = os.environ.get("GITHUB_TOKEN", "")
+
+        # ── Clone ───────────────────────────────────────────────────────
+        try:
+            repo_dir = _clone_repo(repo_url, branch, repo_token)
+            _log(jid, f"✅ Cloned to {repo_dir}")
+        except Exception as exc:
+            return {"error": f"❌ Could not clone repository: {exc}\n"
+                             f"Make sure the URL is correct and the repo is public "
+                             f"(or add GITHUB_TOKEN to your .env for private repos)."}
+
+        # ── Scan repo ───────────────────────────────────────────────────
+        _log(jid, "🔍 Scanning repository structure…")
+        scan = _scan_repo(repo_dir)
+        _log(jid, f"   Type: {scan['project_type']} | "
+                  f"Dockerfile: {scan['has_dockerfile']} | "
+                  f"Terraform: {scan['has_tf_files']} | "
+                  f"sre.yaml: {scan['has_sre_yaml']}")
+        _log(jid, f"   Files found: {len(scan['file_tree'])}")
+
+        # ── If repo has its own .tf files, offer to use them ───────────
+        if scan["has_tf_files"] and not scan["has_dockerfile"]:
+            _log(jid, "📋 Repo has existing Terraform files — merging with managed state…")
+
+        # ── Snapshot before writing ─────────────────────────────────────
+        TerraformTools.snapshot_main_tf()
+
+        # ── Gemini generates HCL ────────────────────────────────────────
+        hcl = _gemini_analyse_repo(
+            scan, repo_url, app_name, environment, user_prompt, jid)
+
+        if not hcl or len(hcl.strip()) < 20:
+            return {"error": "❌ Gemini could not generate deployment HCL for this repository. "
+                             "Make sure the repo has a Dockerfile or recognisable project structure."}
+
+        _log(jid, f"📝 Generated {len(hcl.split(chr(10)))} lines of Terraform HCL")
+
+        # ── Strip forbidden blocks + write to main.tf ───────────────────
+        hcl_clean = TerraformTools._strip_provider_blocks(hcl)
+        result    = TerraformTools.write_code(hcl_clean)
+
+        if result.startswith("DUPLICATE:"):
+            dupes = result.replace("DUPLICATE:", "")
+            _log(jid, f"⚠️ Duplicate resources detected: {dupes} — updating in place")
+            # For redeploy: overwrite the duplicate blocks
+            existing = TerraformTools.read_code()
+            for d in dupes.split(","):
+                d = d.strip()
+                if d:
+                    existing = re.sub(
+                        rf'(resource\s+"[\w"]+"\s+"{re.escape(d)}"\s+\{{[^}}]*(?:\{{[^}}]*\}}[^}}]*)*\}})',
+                        '', existing, flags=re.DOTALL)
+            with open(f"{TF_DIR}/main.tf", "w") as f:
+                f.write(existing.strip() + "\n\n" + hcl_clean.strip() + "\n")
+
+        # ── Run plan ────────────────────────────────────────────────────
+        _log(jid, "🔎 Running terraform plan…")
+        plan = TerraformTools.run_plan(jid)
+
+        if plan.startswith("❌"):
+            TerraformTools.revert_to_snapshot()
+            return {"error": f"❌ Terraform plan failed:\n{plan}"}
+
+        # ── Build deploy meta ───────────────────────────────────────────
+        meta = {
+            "repo_url":      repo_url,
+            "branch":        branch,
+            "app_name":      app_name,
+            "environment":   environment,
+            "project_type":  scan["project_type"],
+            "has_dockerfile": scan["has_dockerfile"],
+            "has_sre_yaml":  scan["has_sre_yaml"],
+            "image_hint":    f"gcr.io/{GCP_PROJECT_ID}/{app_name}:latest",
+        }
+
+        deploy_type = scan["project_type"] or "application"
+        image_note = ""
+        if scan["has_dockerfile"]:
+            image_note = (f"\n\n💡 **Before applying:** push your Docker image:\n"
+                          f"```\ngcloud builds submit --tag gcr.io/{GCP_PROJECT_ID}/{app_name}:latest .\n```")
+
+        msg = (f"🚀 **Deployment plan ready** for `{app_name}` ({deploy_type}) "
+               f"from `{repo_url.split('/')[-1]}`\n"
+               f"Environment: **{environment}** · Branch: **{branch}**"
+               + image_note)
+
+        return {"plan": plan, "meta": meta, "message": msg}
+
+    finally:
+        # Always clean up temp clone
+        if repo_dir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(repo_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def start_deploy_job(repo_url: str, branch: str = "main", app_name: str = "",
+                     environment: str = "production", user_prompt: str = "",
+                     repo_token: str = "", user: str = "unknown") -> str:
+    """
+    Start an async repo deploy job. Returns job ID.
+    Called by:
+      1. _agent_worker when action="deploy" (chat/voice path)
+      2. UI deploy panel directly (URL input path)
+    """
+    jid = _new_job()
+    with JOBS_LOCK:
+        JOBS[jid]["_job_type"] = "deploy"
+        JOBS[jid]["_user"]     = user
+
+    def _worker():
+        result = _run_repo_deploy(
+            repo_url    = repo_url,
+            branch      = branch,
+            app_name    = app_name,
+            environment = environment,
+            user_prompt = user_prompt,
+            jid         = jid,
+            user        = user,
+            repo_token  = repo_token,
+        )
+        if result.get("error"):
+            _error(jid, result["error"])
+            return
+
+        plan         = result["plan"]
+        current_code = TerraformTools.read_code()
+        plan_details = parse_plan_details(plan, current_code)
+        cost_est     = estimate_plan_cost(plan_details, current_code, jid)
+        security     = audit_security(current_code, plan_details, jid)
+
+        _finish(jid, {
+            "status":         "success",
+            "plan":           plan,
+            "plan_details":   plan_details,
+            "cost_estimate":  cost_est,
+            "security_audit": security,
+            "auto_fixed":     [],
+            "is_destroy":     False,
+            "deploy_meta":    result.get("meta", {}),
+            "message":        result.get("message", "Deployment plan ready."),
+            "collateral_warning": [],
+        })
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jid
+
+
 def start_agent_job(messages: list, user: str = "unknown") -> str:
     jid = _new_job()
     with JOBS_LOCK:
@@ -2986,81 +3513,170 @@ def start_agent_job(messages: list, user: str = "unknown") -> str:
 
 def detect_drift(jid: str) -> dict:
     """
-    Run terraform plan -refresh-only to detect drift between state and GCP.
-    Returns structured drift report: {drifted: [...], deleted: [...], clean: bool}
+    Run terraform plan -refresh-only to detect drift.
+    Works with both local and GCS remote state.
+    Runs terraform init first to pull remote state from GCS if configured.
+    Returns: {clean, deleted, modified, summary, raw_plan, how_to_fix}
     """
-    _log(jid, "🔄 Running drift detection (terraform plan -refresh-only)…")
-
-    # First refresh state from GCP
-    res = subprocess.run(
-        ["terraform", "plan", "-refresh-only", "-no-color"],
-        cwd=TF_DIR, capture_output=True, text=True, timeout=120
-    )
-    output = res.stdout + res.stderr
+    _log(jid, "🔄 Checking infrastructure drift (terraform plan -refresh-only)…")
+    _log(jid, "   Reads live GCP state — no changes will be made.")
 
     drift_report = {
-        "clean":    False,
-        "deleted":  [],   # resources in state but gone from GCP
-        "modified": [],   # resources that changed outside Terraform
-        "summary":  "",
-        "raw_plan": output[:3000],
+        "clean":      False,
+        "deleted":    [],
+        "modified":   [],
+        "summary":    "",
+        "how_to_fix": "",
+        "raw_plan":   "",
     }
 
-    if "No changes" in output and "state is up-to-date" in output.lower() or \
-       "Your infrastructure matches the configuration" in output:
-        drift_report["clean"]   = True
-        drift_report["summary"] = "✅ No drift detected — GCP matches Terraform state."
-        _log(jid, "✅ No drift.")
+    # ── Step 1: Init to connect to GCS remote state ──────────────────────
+    _log(jid, "🔧 Initializing Terraform (connecting to GCS remote state)…")
+    init_result = TerraformTools.run_init(jid)
+    if init_result not in ("ok", "") and "✅" not in init_result:
+        _log(jid, f"⚠️ Init warning: {init_result[:120]} — attempting anyway…")
+
+    # ── Step 2: Check what's in remote state ─────────────────────────────
+    state_list_res = subprocess.run(
+        ["terraform", "state", "list"],
+        cwd=TF_DIR, capture_output=True, text=True, timeout=60
+    )
+    state_list_out = state_list_res.stdout.strip()
+
+    if state_list_res.returncode != 0 or not state_list_out:
+        # No resources in state at all
+        drift_report["summary"]    = "⚠️ No resources in Terraform state — nothing has been applied yet."
+        drift_report["how_to_fix"] = "Deploy some infrastructure first (e.g. 'create vm test e2-micro us-central1' then Apply), then check drift."
+        _log(jid, drift_report["summary"])
         return drift_report
 
-    # Parse deleted resources (gone from GCP but still in state)
-    # Terraform shows these as: "- resource_type.resource_name" with "has been deleted"
+    resource_count = len([l for l in state_list_out.splitlines() if l.strip()])
+    _log(jid, f"📋 {resource_count} resource(s) in state — running refresh-only plan…")
+
+    # ── Step 3: Restore main.tf from GCS if missing locally ──────────────
+    # On Cloud Run the container is ephemeral — main.tf is gone after restart.
+    # terraform plan -refresh-only still needs the .tf config files.
+    main_tf_path = f"{TF_DIR}/main.tf"
+    if not os.path.exists(main_tf_path) or not open(main_tf_path).read().strip():
+        state_bucket = os.environ.get("TF_STATE_BUCKET", "")
+        if state_bucket:
+            _log(jid, "📥 Restoring main.tf from GCS…")
+            try:
+                from google.cloud import storage as _gcs
+                _client = _gcs.Client()
+                _blob   = _client.bucket(state_bucket).blob("main.tf")
+                if _blob.exists():
+                    _blob.download_to_filename(main_tf_path)
+                    _log(jid, "✅ main.tf restored from GCS")
+                else:
+                    # main.tf not in GCS either — create a minimal placeholder
+                    # that lets terraform plan read state without failing on missing config
+                    _log(jid, "⚠️ main.tf not in GCS — generating from state list…")
+                    _placeholder = "# Restored for drift check\n"
+                    for addr in state_list_out.splitlines():
+                        addr = addr.strip()
+                        if "." in addr:
+                            rtype, rname = addr.split(".", 1)
+                            _placeholder += (
+                                f'\nresource "{rtype}" "{rname}" {{}}\n'
+                            )
+                    with open(main_tf_path, "w") as _f:
+                        _f.write(_placeholder)
+            except Exception as _exc:
+                _log(jid, f"⚠️ Could not restore main.tf: {_exc} — drift may be incomplete")
+
+    # ── Step 4: Run the actual drift check ────────────────────────────────
+    res = subprocess.run(
+        ["terraform", "plan", "-refresh-only", "-no-color"],
+        cwd=TF_DIR, capture_output=True, text=True, timeout=180
+    )
+    output = res.stdout + res.stderr
+    drift_report["raw_plan"] = output[:4000]
+
+    # ── Clean: no drift ───────────────────────────────────────────────────
+    clean_signals = [
+        "No changes",
+        "Your infrastructure matches the configuration",
+        "state is up-to-date",
+    ]
+    if any(s.lower() in output.lower() for s in clean_signals):
+        drift_report["clean"]      = True
+        drift_report["summary"]    = f"✅ No drift — all {resource_count} resource(s) match GCP exactly."
+        drift_report["how_to_fix"] = ""
+        _log(jid, drift_report["summary"])
+        return drift_report
+
+    # ── Parse deleted and modified resources ──────────────────────────────
+    seen_deleted  = set()
+    seen_modified = set()
+
     for line in output.splitlines():
-        clean = line.strip().lstrip("│ ").strip()
+        clean_line = line.strip().lstrip("│ ").strip()
 
         # Deleted: "google_compute_instance.vm-prod has been deleted"
         m_del = re.search(
-            r'([\w.]+)\s+has been deleted|'
-            r'([\w.]+)\s+no longer exists|'
-            r'Resource\s+([\w.]+)\s+.*deleted',
-            clean, re.IGNORECASE)
+            r'(google_[\w]+\.[\w\-]+)\s+(?:has been deleted|no longer exists|was deleted)',
+            clean_line, re.IGNORECASE)
+        if not m_del:
+            m_del = re.search(r'(google_[\w]+\.[\w\-]+)\s+must be replaced', clean_line)
         if m_del:
-            name = (m_del.group(1) or m_del.group(2) or m_del.group(3) or "").strip()
-            if name and "." in name and name not in [d["address"] for d in drift_report["deleted"]]:
-                parts = name.split(".", 1)
+            addr = m_del.group(1).strip()
+            if addr not in seen_deleted:
+                seen_deleted.add(addr)
+                parts = addr.split(".", 1)
                 drift_report["deleted"].append({
-                    "address":       name,
+                    "address":       addr,
                     "resource_type": parts[0],
-                    "resource_name": parts[1] if len(parts) > 1 else name,
-                    "action":        "deleted_outside_terraform",
+                    "resource_name": parts[1] if len(parts) > 1 else addr,
+                    "detail":        clean_line[:120],
                 })
 
-        # Modified: lines with "~" (update-in-place drift)
-        m_mod = re.match(r'~\s+([\w.]+)', clean)
+        # Modified: "~ google_compute_instance.vm-prod"
+        m_mod = re.match(r'[~]\s+(google_[\w]+\.[\w\-]+)', clean_line)
         if m_mod:
-            name = m_mod.group(1).strip()
-            if name and "." in name and name not in [m["address"] for m in drift_report["modified"]]:
+            addr = m_mod.group(1).strip()
+            if addr not in seen_modified and addr not in seen_deleted:
+                seen_modified.add(addr)
                 drift_report["modified"].append({
-                    "address": name,
-                    "action":  "modified_outside_terraform",
+                    "address": addr,
+                    "detail":  "Modified outside Terraform (e.g. via GCP Console)",
                 })
 
     n_del = len(drift_report["deleted"])
     n_mod = len(drift_report["modified"])
 
+    # ── Plan errored with no parsed resources ─────────────────────────────
     if n_del == 0 and n_mod == 0 and res.returncode != 0:
-        # Plan errored — state is likely broken
         drift_report["summary"] = (
-            f"⚠️ Terraform plan error — state may be corrupted.\n"
-            f"Run: terraform state list\nError:\n{output[-500:]}"
+            "⚠️ Terraform refresh failed — check credentials or state file.\n"
+            f"Error:\n{output[-400:]}"
         )
-    else:
-        parts = []
-        if n_del: parts.append(f"🗑️ {n_del} resource(s) deleted from GCP console")
-        if n_mod: parts.append(f"✏️ {n_mod} resource(s) modified outside Terraform")
-        drift_report["summary"] = "\n".join(parts) or "⚠️ Drift detected — see plan output."
+        drift_report["how_to_fix"] = (
+            "1. Verify GOOGLE_CREDENTIALS is set correctly\n"
+            "2. Check TF_STATE_BUCKET is accessible\n"
+            "3. Ask agent: 'restore previous version' if state is corrupted"
+        )
+        _log(jid, "❌ Plan error during drift check")
+        return drift_report
 
-    _log(jid, f"⚠️ Drift: {n_del} deleted, {n_mod} modified")
+    # ── Build human summary ───────────────────────────────────────────────
+    parts = []
+    if n_del:
+        names = ", ".join(f"`{d['address']}`" for d in drift_report["deleted"][:3])
+        parts.append(f"🗑️ **{n_del} resource(s) deleted from GCP** (still in Terraform state):\n  {names}")
+    if n_mod:
+        names = ", ".join(f"`{m['address']}`" for m in drift_report["modified"][:3])
+        parts.append(f"✏️ **{n_mod} resource(s) modified** via GCP Console:\n  {names}")
+
+    drift_report["summary"] = "\n\n".join(parts) if parts else "⚠️ Drift detected — check plan output below."
+    drift_report["how_to_fix"] = (
+        "**Option A — Accept GCP changes** (update Terraform state to match GCP reality):\n"
+        "  Click 'Reconcile state' in the Drift Detection panel\n\n"
+        "**Option B — Revert to Terraform code** (push your code config back to GCP):\n"
+        "  Click 'Revert to code' in the Drift Detection panel"
+    )
+
+    _log(jid, f"⚠️ Drift found: {n_del} deleted, {n_mod} modified")
     return drift_report
 
 

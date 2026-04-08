@@ -3,66 +3,63 @@ version: '3.8'
 services:
 
   # ── Auth Proxy ──────────────────────────────────────────────────────────────
-  # Sits in front of the SRE agent.
   # ALL traffic enters here first. Validates JWT session cookie.
-  # Proxies authenticated requests to ai-sre-gcp on the internal network.
-  # Public port: 8080 (replaces direct Streamlit exposure)
+  # Proxies authenticated requests to ai-sre-gcp on internal network.
+  # Public port: 8080
   auth:
     build:
       context: ./auth-service
       dockerfile: Dockerfile
     container_name: sre_auth
     ports:
-      - "8080:8000"        # Public-facing: http://localhost:8080
+      - "8080:8080"
     environment:
-      # ── REQUIRED: Change this to a random 32+ char string ───────────────
-      AUTH_SECRET_KEY: "CHANGE-ME-generate-with-openssl-rand-hex-32"
-
-      # ── Where Streamlit lives (internal Docker network) ──────────────────
-      STREAMLIT_URL: "http://ai-sre-gcp:8080"
-
-      # ── Session settings ─────────────────────────────────────────────────
+      AUTH_SECRET_KEY: "${AUTH_SECRET_KEY:-CHANGE-ME-generate-with-openssl-rand-hex-32}"
+      STREAMLIT_URL:   "http://ai-sre-gcp:8080"
       SESSION_TTL_HOURS: "8"
-      AUTH_REALM: "AI SRE Agent"
-
-      # Set to "true" if you put HTTPS in front (nginx/Caddy/Cloud Load Balancer)
-      COOKIE_SECURE: "false"
-
-      LOG_LEVEL: "INFO"
+      AUTH_REALM:      "AI SRE Agent"
+      COOKIE_SECURE:   "false"
+      LOG_LEVEL:       "INFO"
+      PORT:            "8080"
+      # Optional: override users via env instead of users.json
+      # ADMIN_PASSWORD: "your-password-here"
     volumes:
-      # Mount your users file here — edit auth-service/users.json
       - ./auth-service/users.json:/app/users.json:ro
     depends_on:
-      - ai-sre-gcp
+      ai-sre-gcp:
+        condition: service_healthy
     restart: always
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/healthz"]
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 10s
       timeout: 5s
       retries: 3
 
   # ── AI SRE Agent (Streamlit) ────────────────────────────────────────────────
-  # NO longer exposed directly on a public port.
-  # Only reachable from the auth service on the internal Docker network.
+  # NOT exposed on a public port — only reachable from auth + monitor
+  # on the internal Docker network.
   ai-sre-gcp:
     build: .
     container_name: sre_gemini_agent
     env_file: .env
-    # !! Port removed — Streamlit is NOT publicly accessible anymore
-    # Only the auth service can reach it via the internal network
     expose:
       - "8080"
     volumes:
       - ./terraform_files:/app/terraform_files
-      # Uncomment if using GOOGLE_APPLICATION_CREDENTIALS:
+      # Uncomment if using file-based credentials:
       # - ./gcp-credentials.json:/app/gcp-credentials.json:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379
       - STREAMLIT_SERVER_ENABLE_CORS=false
       - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
       - STREAMLIT_SERVER_PORT=8080
       - STREAMLIT_SERVER_ADDRESS=0.0.0.0
       - STREAMLIT_SERVER_HEADLESS=true
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: always
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/_stcore/health"]
@@ -71,6 +68,77 @@ services:
       retries: 5
       start_period: 30s
 
+  # ── Redis — shared event bus ────────────────────────────────────────────────
+  # Used by: ai-sre-gcp (job state) ↔ monitor-agent (alerts + heartbeat)
+  # Channel layout:
+  #   sre:alerts:ui        → monitor pushes alerts, UI polls
+  #   sre:monitor:hb       → monitor heartbeat key (TTL 5min)
+  #   sre:monitor:commands → UI sends "run_now" to monitor
+  redis:
+    image: redis:7-alpine
+    container_name: sre_redis
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ── Monitor Agent ───────────────────────────────────────────────────────────
+  # Autonomous 24/7 background service — completely separate from the UI.
+  # Polls GCP every 120s, detects anomalies, fires alerts via Redis.
+  # Rule-based checks (fast) + Gemini AI anomaly detection (async).
+  #
+  # What it monitors:
+  #   - VM state changes (stopped, error, disappeared)
+  #   - Cloud Run service health (HTTP ping + readiness)
+  #   - Log error rate and CRITICAL entries
+  #   - Publicly accessible GCS buckets
+  #   - Auth service reachability (catches the Forbidden bug early)
+  #   - Terraform state staleness (drift risk indicator)
+  monitor-agent:
+    build:
+      context: ./monitor-agent
+      dockerfile: Dockerfile
+    container_name: sre_monitor
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MONITOR_INTERVAL_SECS=${MONITOR_INTERVAL_SECS:-120}
+      - ALERT_COOLDOWN_SECS=${ALERT_COOLDOWN_SECS:-600}
+      - LOG_ERROR_RATE_THRESHOLD=${LOG_ERROR_RATE_THRESHOLD:-10}
+      - MONITOR_VM=${MONITOR_VM:-true}
+      - MONITOR_BUCKETS=${MONITOR_BUCKETS:-true}
+      - MONITOR_LOGS=${MONITOR_LOGS:-true}
+      - MONITOR_COSTS=${MONITOR_COSTS:-true}
+      # Health check URLs — monitor pings these to detect Forbidden/down
+      - AUTH_SERVICE_URL=http://auth:8080
+      - APP_SERVICE_URL=http://ai-sre-gcp:8080
+      # Notification channels (set in .env, all optional)
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - PAGERDUTY_ROUTING_KEY=${PAGERDUTY_ROUTING_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      ai-sre-gcp:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
 networks:
   default:
-    name: ai_network
+    name: ai_sre_network
+
+volumes:
+  terraform_files:
